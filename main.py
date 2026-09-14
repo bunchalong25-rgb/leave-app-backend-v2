@@ -2,13 +2,15 @@ import os
 import json
 import uuid
 import io
+import urllib.parse
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from typing import Optional, List, Dict
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import openpyxl
+import httpx
 from excel_processor import create_sample_template, process_excel_template
 
 app = FastAPI(title="Staff Leave Management API")
@@ -29,7 +31,7 @@ SAMPLE_TEMPLATE_PATH = os.path.join(UPLOADS_DIR, "sample_template.xlsx")
 if not os.path.exists(SAMPLE_TEMPLATE_PATH):
     create_sample_template(SAMPLE_TEMPLATE_PATH)
 
-# Clean initial database seed with NO mock data
+# Clean initial database seed
 INITIAL_DB = {
     "brands": [],
     "employees": [],
@@ -118,63 +120,109 @@ class EmployeeRequest(BaseModel):
     name: str
     brand: str
 
+# Base Configs
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://creative-macaron-98004d.netlify.app")
+LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CALLBACK_URL = os.getenv("LINE_CALLBACK_URL", "https://leave-app-backend-v2.onrender.com/api/auth/line/callback")
+
 # Routes
 @app.get("/")
 def read_root():
     return {"message": "Staff Leave Management API is online", "status": "ok"}
 
-@app.get("/api/brands")
-def get_brands():
-    db = read_db()
-    return {"brands": db.get("brands", [])}
+# ---------------------------------------------------------
+# REAL LINE LOGIN OAUTH 2.0 FLOW
+# ---------------------------------------------------------
 
-@app.post("/api/brands")
-def add_brand(req: BrandRequest):
-    db = read_db()
-    brands = db.get("brands", [])
-    if not any(b["name"] == req.name for b in brands):
-        new_b = {"id": f"b_{int(datetime.utcnow().timestamp())}", "name": req.name}
-        brands.append(new_b)
-        db["brands"] = brands
-        write_db(db)
-        return {"success": True, "brand": new_b}
-    return {"success": True, "message": "แบรนด์นี้มีอยู่แล้ว"}
+@app.get("/api/auth/line/login")
+def line_oauth_login():
+    channel_id = LINE_CHANNEL_ID
+    if not channel_id:
+        # Fallback if channel ID env variable not yet configured
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=LINE_CHANNEL_ID_NOT_CONFIGURED")
 
-@app.get("/api/employees")
-def get_employees():
-    db = read_db()
-    return {"employees": db.get("employees", [])}
-
-@app.post("/api/employees")
-def add_employee(req: EmployeeRequest):
-    db = read_db()
-    employees = db.get("employees", [])
-    new_emp = {
-        "id": f"emp_{int(datetime.utcnow().timestamp())}",
-        "name": req.name,
-        "brand": req.brand
+    state = uuid.uuid4().hex[:12]
+    params = {
+        "response_type": "code",
+        "client_id": channel_id,
+        "redirect_uri": LINE_CALLBACK_URL,
+        "state": state,
+        "scope": "profile openid"
     }
-    employees.append(new_emp)
-    db["employees"] = employees
 
-    # Ensure brand is added to brands list
-    brands = db.get("brands", [])
-    if req.brand and not any(b["name"] == req.brand for b in brands):
-        brands.append({"id": f"b_{int(datetime.utcnow().timestamp())}", "name": req.brand})
-        db["brands"] = brands
+    line_authorize_url = f"https://access.line.me/oauth2/v2.1/authorize?{urllib.parse.urlencode(params)}"
+    return RedirectResponse(url=line_authorize_url)
 
-    write_db(db)
-    return {"success": True, "employee": new_emp}
 
-@app.delete("/api/employees/{emp_id}")
-def delete_employee(emp_id: str):
-    db = read_db()
-    db["employees"] = [e for e in db.get("employees", []) if e["id"] != emp_id]
-    write_db(db)
-    return {"success": True}
+@app.get("/api/auth/line/callback")
+async def line_oauth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    if error or not code:
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error={error or 'NO_CODE'}")
+
+    try:
+        # 1. Exchange Auth Code for Access Token
+        token_url = "https://api.line.me/oauth2/v2.1/token"
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": LINE_CALLBACK_URL,
+            "client_id": LINE_CHANNEL_ID,
+            "client_secret": LINE_CHANNEL_SECRET,
+        }
+
+        async with httpx.AsyncClient() as client:
+            token_res = await client.post(
+                token_url,
+                data=token_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+
+            if token_res.status_code != 200:
+                print("LINE Token exchange failed:", token_res.text)
+                return RedirectResponse(url=f"{FRONTEND_URL}/?error=TOKEN_EXCHANGE_FAILED")
+
+            tokens = token_res.json()
+            access_token = tokens.get("access_token")
+
+            # 2. Get User Profile from LINE API
+            profile_res = await client.get(
+                "https://api.line.me/v2/profile",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+
+            if profile_res.status_code != 200:
+                print("LINE Profile fetch failed:", profile_res.text)
+                return RedirectResponse(url=f"{FRONTEND_URL}/?error=PROFILE_FETCH_FAILED")
+
+            profile = profile_res.json()
+            line_user_id = profile.get("userId")
+            display_name = profile.get("displayName", "")
+            picture_url = profile.get("pictureUrl", "")
+
+            # 3. Check DB if User exists
+            db = read_db()
+            users = db.get("users", [])
+            existing_user = next((u for u in users if u.get("lineUserId") == line_user_id), None)
+
+            # 4. Redirect back to Frontend Netlify with User info Query Params
+            if existing_user:
+                user_json = urllib.parse.quote(json.dumps(existing_user))
+                return RedirectResponse(url=f"{FRONTEND_URL}/?exists=true&user={user_json}")
+            else:
+                encoded_name = urllib.parse.quote(display_name)
+                encoded_pic = urllib.parse.quote(picture_url)
+                return RedirectResponse(
+                    url=f"{FRONTEND_URL}/?exists=false&lineUserId={line_user_id}&displayName={encoded_name}&pictureUrl={encoded_pic}"
+                )
+
+    except Exception as e:
+        print("Error in LINE OAuth Callback:", str(e))
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=INTERNAL_CALLBACK_ERROR")
+
 
 # ---------------------------------------------------------
-# AUTHENTICATION & ONBOARDING
+# AUTHENTICATION & ONBOARDING API
 # ---------------------------------------------------------
 
 @app.post("/api/auth/login-line")
@@ -195,7 +243,6 @@ def get_onboarding_options():
     brands = db.get("brands", [])
     employees = db.get("employees", [])
     
-    # Claimed employee names
     claimed_names = set(u.get("fullName") for u in users if u.get("role") == "staff")
     available_employees = [e for e in employees if e.get("name") not in claimed_names]
 
@@ -250,7 +297,6 @@ async def upload_master_data(file: UploadFile = File(...)):
     added_emp_count = 0
     added_brand_count = 0
 
-    # Locate headers in row 1
     name_col = 1
     brand_col = 2
 
@@ -299,7 +345,6 @@ def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supe
     users = db.get("users", [])
     leave_records = db.get("leaveRecords", [])
 
-    # Filter staff users
     staff_users = [u for u in users if u.get("role") == "staff"]
     if supervisorId:
         staff_users = [u for u in staff_users if u.get("supervisorId") == supervisorId]
@@ -335,6 +380,16 @@ def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supe
 # ---------------------------------------------------------
 # CUTOFFS & LEAVE RECORDS
 # ---------------------------------------------------------
+
+@app.get("/api/brands")
+def get_brands():
+    db = read_db()
+    return {"brands": db.get("brands", [])}
+
+@app.get("/api/employees")
+def get_employees():
+    db = read_db()
+    return {"employees": db.get("employees", [])}
 
 @app.get("/api/cutoffs")
 def get_cutoffs():
