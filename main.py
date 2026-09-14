@@ -1,17 +1,18 @@
 import os
 import json
 import uuid
+import io
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
+import openpyxl
 from excel_processor import create_sample_template, process_excel_template
 
 app = FastAPI(title="Staff Leave Management API")
 
-# Enable CORS for Netlify and all origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,44 +26,21 @@ UPLOADS_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 SAMPLE_TEMPLATE_PATH = os.path.join(UPLOADS_DIR, "sample_template.xlsx")
 
-# Ensure sample template exists
 if not os.path.exists(SAMPLE_TEMPLATE_PATH):
     create_sample_template(SAMPLE_TEMPLATE_PATH)
 
-# Initial DB seed
+# Clean initial database seed with NO mock data
 INITIAL_DB = {
-    "brands": [
-        {"id": "1", "name": "Brand Alpha (สาขา สยาม)"},
-        {"id": "2", "name": "Brand Beta (สาขา ชิดลม)"},
-        {"id": "3", "name": "Brand Gamma (สาขา พารากอน)"},
-        {"id": "4", "name": "Brand Delta (สาขา ไอคอนสยาม)"}
-    ],
-    "employees": [
-        {"id": "emp_1", "name": "สมชาย สายดี", "brand": "Brand Alpha (สาขา สยาม)", "defaultRole": "staff"},
-        {"id": "emp_2", "name": "วิภาวี มั่นคง", "brand": "Brand Alpha (สาขา สยาม)", "defaultRole": "staff"},
-        {"id": "emp_3", "name": "อภิสิทธิ์ ขยันทำ", "brand": "Brand Beta (สาขา ชิดลม)", "defaultRole": "staff"},
-        {"id": "emp_4", "name": "นภา เพลินตา", "brand": "Brand Beta (สาขา ชิดลม)", "defaultRole": "staff"},
-        {"id": "emp_5", "name": "กิตติพงษ์ ยอดเยี่ยม", "brand": "Brand Delta (สาขา ไอคอนสยาม)", "defaultRole": "staff"},
-        {"id": "emp_6", "name": "ดารินทร์ สุขใจ (หัวหน้า)", "brand": "Brand Alpha (สาขา สยาม)", "defaultRole": "admin"}
-    ],
+    "brands": [],
+    "employees": [],
     "users": [
         {
             "id": "usr_admin",
             "lineUserId": "U_ADMIN_DEMO",
             "displayName": "ดารินทร์ สุขใจ (Admin)",
-            "fullName": "ดารินทร์ สุขใจ (หัวหน้า)",
-            "brand": "Brand Alpha (สาขา สยาม)",
+            "fullName": "ดารินทร์ สุขใจ",
+            "brand": "สำนักงานใหญ่",
             "role": "admin",
-            "hasCompletedOnboarding": True,
-            "createdAt": datetime.utcnow().isoformat()
-        },
-        {
-            "id": "usr_staff1",
-            "lineUserId": "U_STAFF_1",
-            "displayName": "สมชาย (Staff)",
-            "fullName": "สมชาย สายดี",
-            "brand": "Brand Alpha (สาขา สยาม)",
-            "role": "staff",
             "hasCompletedOnboarding": True,
             "createdAt": datetime.utcnow().isoformat()
         }
@@ -83,32 +61,7 @@ INITIAL_DB = {
             "updatedAt": datetime.utcnow().isoformat()
         }
     ],
-    "leaveRecords": [
-        {
-            "id": "lr_1",
-            "userId": "usr_staff1",
-            "userName": "สมชาย สายดี",
-            "brand": "Brand Alpha (สาขา สยาม)",
-            "yearMonth": "2026-09",
-            "period": "1-15",
-            "date": "2026-09-01",
-            "dayNumber": 1,
-            "code": "W",
-            "updatedAt": datetime.utcnow().isoformat()
-        },
-        {
-            "id": "lr_2",
-            "userId": "usr_staff1",
-            "userName": "สมชาย สายดี",
-            "brand": "Brand Alpha (สาขา สยาม)",
-            "yearMonth": "2026-09",
-            "period": "1-15",
-            "date": "2026-09-02",
-            "dayNumber": 2,
-            "code": "C",
-            "updatedAt": datetime.utcnow().isoformat()
-        }
-    ]
+    "leaveRecords": []
 }
 
 def read_db():
@@ -126,22 +79,20 @@ def write_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# Models
+# Request Models
 class LineLoginRequest(BaseModel):
     lineUserId: str
     displayName: Optional[str] = None
 
 class OnboardingRequest(BaseModel):
-    lineUserId: Optional[str] = None
+    lineUserId: str
     displayName: Optional[str] = None
     fullName: str
     brand: str
-    role: Optional[str] = "staff"
+    role: str # 'staff' or 'admin'
+    supervisorId: Optional[str] = None
+    supervisorName: Optional[str] = None
     inviteCode: Optional[str] = None
-
-class MockLoginRequest(BaseModel):
-    role: str
-    lineUserId: Optional[str] = None
 
 class CutoffRequest(BaseModel):
     yearMonth: str
@@ -166,7 +117,6 @@ class BrandRequest(BaseModel):
 class EmployeeRequest(BaseModel):
     name: str
     brand: str
-    defaultRole: Optional[str] = "staff"
 
 # Routes
 @app.get("/")
@@ -181,10 +131,14 @@ def get_brands():
 @app.post("/api/brands")
 def add_brand(req: BrandRequest):
     db = read_db()
-    new_b = {"id": f"b_{int(datetime.utcnow().timestamp())}", "name": req.name}
-    db["brands"].append(new_b)
-    write_db(db)
-    return {"success": True, "brand": new_b}
+    brands = db.get("brands", [])
+    if not any(b["name"] == req.name for b in brands):
+        new_b = {"id": f"b_{int(datetime.utcnow().timestamp())}", "name": req.name}
+        brands.append(new_b)
+        db["brands"] = brands
+        write_db(db)
+        return {"success": True, "brand": new_b}
+    return {"success": True, "message": "แบรนด์นี้มีอยู่แล้ว"}
 
 @app.get("/api/employees")
 def get_employees():
@@ -194,13 +148,21 @@ def get_employees():
 @app.post("/api/employees")
 def add_employee(req: EmployeeRequest):
     db = read_db()
+    employees = db.get("employees", [])
     new_emp = {
         "id": f"emp_{int(datetime.utcnow().timestamp())}",
         "name": req.name,
-        "brand": req.brand,
-        "defaultRole": req.defaultRole or "staff"
+        "brand": req.brand
     }
-    db["employees"].append(new_emp)
+    employees.append(new_emp)
+    db["employees"] = employees
+
+    # Ensure brand is added to brands list
+    brands = db.get("brands", [])
+    if req.brand and not any(b["name"] == req.brand for b in brands):
+        brands.append({"id": f"b_{int(datetime.utcnow().timestamp())}", "name": req.brand})
+        db["brands"] = brands
+
     write_db(db)
     return {"success": True, "employee": new_emp}
 
@@ -210,6 +172,10 @@ def delete_employee(emp_id: str):
     db["employees"] = [e for e in db.get("employees", []) if e["id"] != emp_id]
     write_db(db)
     return {"success": True}
+
+# ---------------------------------------------------------
+# AUTHENTICATION & ONBOARDING
+# ---------------------------------------------------------
 
 @app.post("/api/auth/login-line")
 def login_line(req: LineLoginRequest):
@@ -221,21 +187,42 @@ def login_line(req: LineLoginRequest):
     else:
         return {"exists": False, "lineUserId": req.lineUserId, "displayName": req.displayName}
 
+@app.get("/api/onboarding/options")
+def get_onboarding_options():
+    db = read_db()
+    users = db.get("users", [])
+    supervisors = [{"id": u["id"], "fullName": u["fullName"]} for u in users if u.get("role") == "admin"]
+    brands = db.get("brands", [])
+    employees = db.get("employees", [])
+    
+    # Claimed employee names
+    claimed_names = set(u.get("fullName") for u in users if u.get("role") == "staff")
+    available_employees = [e for e in employees if e.get("name") not in claimed_names]
+
+    return {
+        "supervisors": supervisors,
+        "brands": brands,
+        "masterEmployees": available_employees,
+        "hasMasterData": len(employees) > 0 and len(supervisors) > 0
+    }
+
 @app.post("/api/auth/register-onboarding")
 def register_onboarding(req: OnboardingRequest):
     if req.role == "admin":
         invite_code_env = os.getenv("ADMIN_INVITE_CODE", "ADMIN2026")
         if not req.inviteCode or req.inviteCode.strip().upper() != invite_code_env:
             raise HTTPException(status_code=403, detail="รหัสผ่านพิเศษ (Invite Code) สำหรับหัวหน้าแผนกไม่ถูกต้อง")
-    
+
     db = read_db()
     user = {
         "id": f"usr_{int(datetime.utcnow().timestamp())}",
-        "lineUserId": req.lineUserId or f"LINE_{uuid.uuid4().hex[:8]}",
+        "lineUserId": req.lineUserId,
         "displayName": req.displayName or req.fullName,
         "fullName": req.fullName,
         "brand": req.brand,
-        "role": req.role or "staff",
+        "role": req.role,
+        "supervisorId": req.supervisorId,
+        "supervisorName": req.supervisorName,
         "hasCompletedOnboarding": True,
         "createdAt": datetime.utcnow().isoformat()
     }
@@ -243,14 +230,111 @@ def register_onboarding(req: OnboardingRequest):
     write_db(db)
     return {"success": True, "user": user}
 
-@app.post("/api/auth/login-mock")
-def login_mock(req: MockLoginRequest):
+# ---------------------------------------------------------
+# ADMIN MASTER DATA UPLOAD & STATUS DASHBOARD
+# ---------------------------------------------------------
+
+@app.post("/api/admin/upload-master-data")
+async def upload_master_data(file: UploadFile = File(...)):
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์ Excel (.xlsx)")
+
+    content = await file.read()
+    wb = openpyxl.load_workbook(filename=io.BytesIO(content))
+    ws = wb.active
+
+    db = read_db()
+    existing_employees = db.get("employees", [])
+    existing_brands = db.get("brands", [])
+
+    added_emp_count = 0
+    added_brand_count = 0
+
+    # Locate headers in row 1
+    name_col = 1
+    brand_col = 2
+
+    for c in range(1, ws.max_column + 1):
+        val = str(ws.cell(row=1, column=c).value or "").strip().lower()
+        if "ชื่อ" in val or "name" in val:
+            name_col = c
+        elif "แบรนด์" in val or "brand" in val:
+            brand_col = c
+
+    for r in range(2, ws.max_row + 1):
+        emp_name = str(ws.cell(row=r, column=name_col).value or "").strip()
+        brand_name = str(ws.cell(row=r, column=brand_col).value or "").strip()
+
+        if emp_name:
+            if not any(e["name"] == emp_name for e in existing_employees):
+                existing_employees.append({
+                    "id": f"emp_{int(datetime.utcnow().timestamp())}_{r}",
+                    "name": emp_name,
+                    "brand": brand_name or "General"
+                })
+                added_emp_count += 1
+
+        if brand_name:
+            if not any(b["name"] == brand_name for b in existing_brands):
+                existing_brands.append({
+                    "id": f"b_{int(datetime.utcnow().timestamp())}_{r}",
+                    "name": brand_name
+                })
+                added_brand_count += 1
+
+    db["employees"] = existing_employees
+    db["brands"] = existing_brands
+    write_db(db)
+
+    return {
+        "success": True,
+        "message": f"นำเข้าข้อมูลสำเร็จ: เพิ่มพนักงาน {added_emp_count} คน, เพิ่มแบรนด์ {added_brand_count} แบรนด์",
+        "addedEmployees": added_emp_count,
+        "addedBrands": added_brand_count
+    }
+
+@app.get("/api/admin/submission-status")
+def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supervisorId: Optional[str] = None):
     db = read_db()
     users = db.get("users", [])
-    matched = next((u for u in users if u.get("role") == req.role), None)
-    if not matched:
-        matched = users[0] if users else None
-    return {"success": True, "user": matched}
+    leave_records = db.get("leaveRecords", [])
+
+    # Filter staff users
+    staff_users = [u for u in users if u.get("role") == "staff"]
+    if supervisorId:
+        staff_users = [u for u in staff_users if u.get("supervisorId") == supervisorId]
+
+    submitted_user_ids = set(
+        r.get("userId") for r in leave_records
+        if r.get("yearMonth") == yearMonth and r.get("period") == period
+    )
+
+    submitted_list = []
+    pending_list = []
+
+    for u in staff_users:
+        info = {
+            "userId": u.get("id"),
+            "fullName": u.get("fullName"),
+            "brand": u.get("brand"),
+            "supervisorName": u.get("supervisorName", "-")
+        }
+        if u.get("id") in submitted_user_ids:
+            submitted_list.append(info)
+        else:
+            pending_list.append(info)
+
+    return {
+        "totalStaff": len(staff_users),
+        "submittedCount": len(submitted_list),
+        "pendingCount": len(pending_list),
+        "submittedList": submitted_list,
+        "pendingList": pending_list
+    }
+
+# ---------------------------------------------------------
+# CUTOFFS & LEAVE RECORDS
+# ---------------------------------------------------------
 
 @app.get("/api/cutoffs")
 def get_cutoffs():
@@ -299,7 +383,6 @@ def save_leaves(req: LeaveSubmitRequest):
         if now_dt > cutoff_dt.replace(tzinfo=None):
             raise HTTPException(status_code=403, detail="ระบบปิดรับการบันทึกข้อมูลสำหรับรอบนี้แล้ว ไม่สามารถแก้ไขได้")
 
-    # Remove existing for user/period
     records = [
         r for r in db.get("leaveRecords", [])
         if not (r.get("userId") == req.userId and r.get("yearMonth") == req.yearMonth and r.get("period") == req.period)
