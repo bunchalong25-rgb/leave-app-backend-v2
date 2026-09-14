@@ -127,6 +127,10 @@ def write_db(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 # Models
+class LineLoginRequest(BaseModel):
+    lineUserId: str
+    displayName: Optional[str] = None
+
 class OnboardingRequest(BaseModel):
     lineUserId: Optional[str] = None
     displayName: Optional[str] = None
@@ -206,6 +210,16 @@ def delete_employee(emp_id: str):
     db["employees"] = [e for e in db.get("employees", []) if e["id"] != emp_id]
     write_db(db)
     return {"success": True}
+
+@app.post("/api/auth/login-line")
+def login_line(req: LineLoginRequest):
+    db = read_db()
+    users = db.get("users", [])
+    matched = next((u for u in users if u.get("lineUserId") == req.lineUserId), None)
+    if matched:
+        return {"exists": True, "user": matched}
+    else:
+        return {"exists": False, "lineUserId": req.lineUserId, "displayName": req.displayName}
 
 @app.post("/api/auth/register-onboarding")
 def register_onboarding(req: OnboardingRequest):
