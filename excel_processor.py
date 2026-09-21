@@ -166,3 +166,110 @@ def process_excel_template(template_path: str, leave_records: list, period: str 
     wb.save(output)
     output.seek(0)
     return output.getvalue(), updated_count
+
+def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2):
+    """
+    ฟังก์ชันสำหรับอ่านไฟล์ Excel อัจฉริยะ (รองรับการอ่านทุก Sheet)
+    ดึงชื่อ แบรนด์ ดึงหมายเหตุ/กะการทำงาน และเช็คเงื่อนไขแบรนด์ที่มีพนักงาน > min_staff_threshold
+    พร้อมระบบป้องกัน Error กรณีแถวว่างหรือโครงสร้างคอลัมน์ไม่แน่นอน
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
+    
+    all_employees = []
+    brand_counts = {}
+    remarks = []
+
+    # คีย์เวิร์ดสำหรับตรวจจับคอลัมน์และหัวตาราง
+    NAME_KEYWORDS = ["ชื่อ-นามสกุล", "ชื่อ - นามสกุล", "ชื่อ-สกุล", "ชื่อพนักงาน", "ชื่อ", "FULLNAME", "NAME"]
+    BRAND_KEYWORDS = ["แบรนด์ / สาขา", "แบรนด์/สาขา", "แบรนด์", "สาขา", "BRAND"]
+    DEPT_KEYWORDS = ["แผนก", "ฝ่าย", "สังกัด", "สายงาน", "DEPARTMENT", "DEPT", "SECTION"]
+    STOP_KEYWORDS = ["สรุปจำนวน", "รวมทั้งสิ้น", "สรุปยอด", "ยอดรวม", "TOTAL", "หมายเหตุ"]
+    SHIFT_KEYWORDS = ["คำอธิบายสัญลักษณ์", "ช่วงเวลาปฏิบัติ", "เวลาปฏิบัติงาน", "เวลาทำงาน", "กะการทำงาน", "กะ ", "กะเช้า", "กะบ่าย", "กะดึก", "W =", "C =", "V =", "S =", "N =", "OFF"]
+
+    # 1. วนลูปอ่านข้อมูล "ทุก Sheet" ในไฟล์
+    for sheet_name in wb.sheetnames:
+        sheet = wb[sheet_name]
+        header_row_index = None
+        brand_col_idx = 0
+        name_col_idx = 1
+        dept_col_idx = None
+        
+        # 2. ค้นหาบรรทัดที่เป็น "หัวตารางที่แท้จริง" (สแกน 25 บรรทัดแรก)
+        for i, row in enumerate(sheet.iter_rows(min_row=1, max_row=25, values_only=True), start=1):
+            if not row:
+                continue
+            row_texts = [str(cell).strip() if cell is not None else "" for cell in row]
+            
+            # ตรวจสอบว่ามีคอลัมน์ชื่อ และ คอลัมน์แบรนด์ ในแถวเดียวกันหรือไม่
+            has_name = any(any(k in text.upper() for k in NAME_KEYWORDS) for text in row_texts)
+            has_brand = any(any(k in text.upper() for k in BRAND_KEYWORDS) for text in row_texts)
+
+            if has_name and has_brand:
+                header_row_index = i
+                for col_idx, text in enumerate(row_texts):
+                    text_upper = text.upper()
+                    if any(k in text_upper for k in BRAND_KEYWORDS):
+                        brand_col_idx = col_idx
+                    elif any(k in text_upper for k in NAME_KEYWORDS):
+                        name_col_idx = col_idx
+                    elif any(k in text_upper for k in DEPT_KEYWORDS):
+                        dept_col_idx = col_idx
+                break
+                
+        # หาก Sheet ไหนไม่ใช่ตารางรายชื่อ ให้ข้ามไป Sheet ถัดไป
+        if header_row_index is None:
+            continue
+            
+        # 3. เริ่มดึงข้อมูลพนักงาน (อ่านต่อจากบรรทัดหัวตารางลงมา)
+        for row in sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
+            if not row:
+                continue
+
+            # ตรวจหาจุดสิ้นสุดของรายชื่อพนักงาน
+            row_sample_str = " ".join([str(c).strip() for c in row[:5] if c is not None])
+            if any(stop_word in row_sample_str for stop_word in STOP_KEYWORDS):
+                break
+                
+            col_brand = str(row[brand_col_idx]).strip() if len(row) > brand_col_idx and row[brand_col_idx] is not None else ""
+            col_name = str(row[name_col_idx]).strip() if len(row) > name_col_idx and row[name_col_idx] is not None else ""
+            col_dept = str(row[dept_col_idx]).strip() if dept_col_idx is not None and len(row) > dept_col_idx and row[dept_col_idx] is not None else ""
+            
+            # ตรวจเช็คว่าบรรทัดนี้เป็นคำสรุปหรือไม่
+            if any(stop_word in col_brand for stop_word in STOP_KEYWORDS) or any(stop_word in col_name for stop_word in STOP_KEYWORDS):
+                break
+
+            # ถ้ามีข้อมูลครบทั้ง Brand และ ชื่อ และไม่ใช่ค่าว่าง/NONE ให้เก็บลงระบบ
+            if col_brand and col_name and col_brand.upper() not in ["NONE", "NULL", "-"] and col_name.upper() not in ["NONE", "NULL", "-"]:
+                # ป้องกันเก็บซ้ำใน Sheet เดียวกัน
+                all_employees.append({
+                    "name": col_name, 
+                    "brand": col_brand,
+                    "department": col_dept or sheet_name
+                })
+                # นับจำนวนคนในแบรนด์ เพื่อเอาไปคำนวณสิทธิ์เลือกกะ
+                brand_counts[col_brand] = brand_counts.get(col_brand, 0) + 1
+                
+        # 4. ดึงข้อมูล "หมายเหตุ" และ "กะการทำงาน" จากตาราง
+        for row in sheet.iter_rows(min_row=1, values_only=True):
+            if not row:
+                continue
+            for cell in row:
+                if cell is not None:
+                    cell_str = str(cell).strip()
+                    if cell_str and any(k in cell_str for k in SHIFT_KEYWORDS):
+                        if cell_str not in remarks:
+                            remarks.append(cell_str)
+                    
+    # 5. กำหนดสิทธิ์เลือกกะ: แบรนด์ไหนมีพนักงานมากกว่าเกณฑ์ (min_staff_threshold)
+    for emp in all_employees:
+        emp["requires_shift_selection"] = brand_counts.get(emp["brand"], 0) > min_staff_threshold
+
+    # ส่งข้อมูลทั้งหมดกลับไปให้ระบบ API 
+    return {
+        "total_employees": len(all_employees),
+        "employees": all_employees,
+        "brand_counts": brand_counts,
+        "remarks": remarks
+    }
+
+
