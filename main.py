@@ -9,9 +9,9 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Re
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-import openpyxl
 import httpx
-from excel_processor import create_sample_template, process_excel_template
+import pymongo
+from excel_processor import create_sample_template, process_excel_template, process_master_data_excel
 
 app = FastAPI(title="Staff Leave Management API")
 
@@ -31,7 +31,6 @@ SAMPLE_TEMPLATE_PATH = os.path.join(UPLOADS_DIR, "sample_template.xlsx")
 if not os.path.exists(SAMPLE_TEMPLATE_PATH):
     create_sample_template(SAMPLE_TEMPLATE_PATH)
 
-# Clean initial database seed
 INITIAL_DB = {
     "brands": [],
     "employees": [],
@@ -66,7 +65,30 @@ INITIAL_DB = {
     "leaveRecords": []
 }
 
+MONGO_URI = os.getenv("MONGO_URI")
+if MONGO_URI:
+    mongo_client = pymongo.MongoClient(MONGO_URI)
+    mongo_db = mongo_client["leave_app_db"]
+    mongo_collection = mongo_db["main_data"]
+    mongo_reset_col = mongo_db["reset_requests"]
+else:
+    mongo_client = None
+    mongo_db = None
+    mongo_collection = None
+    mongo_reset_col = None
+
 def read_db():
+    if mongo_client:
+        try:
+            doc = mongo_collection.find_one({"_id": "main_db"})
+            if not doc:
+                mongo_collection.insert_one({"_id": "main_db", **INITIAL_DB})
+                return INITIAL_DB
+            return doc
+        except Exception as e:
+            print("MongoDB Read Error:", e)
+            return INITIAL_DB
+            
     if not os.path.exists(DB_FILE):
         write_db(INITIAL_DB)
         return INITIAL_DB
@@ -78,8 +100,19 @@ def read_db():
         return INITIAL_DB
 
 def write_db(data):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    if mongo_client:
+        try:
+            data_to_save = {k: v for k, v in data.items() if k != '_id'}
+            mongo_collection.update_one(
+                {"_id": "main_db"}, 
+                {"$set": data_to_save}, 
+                upsert=True
+            )
+        except Exception as e:
+            print("MongoDB Write Error:", e)
+    else:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
 # Request Models
 class LineLoginRequest(BaseModel):
@@ -91,6 +124,7 @@ class OnboardingRequest(BaseModel):
     displayName: Optional[str] = None
     fullName: str
     brand: str
+    department: Optional[str] = None
     role: str # 'staff' or 'admin'
     supervisorId: Optional[str] = None
     supervisorName: Optional[str] = None
@@ -119,6 +153,27 @@ class BrandRequest(BaseModel):
 class EmployeeRequest(BaseModel):
     name: str
     brand: str
+
+class ResetRequestModel(BaseModel):
+    line_user_id: Optional[str] = None
+    lineUserId: Optional[str] = None
+    name: Optional[str] = None
+    fullName: Optional[str] = None
+    brand: Optional[str] = None
+    department: Optional[str] = None
+    userId: Optional[str] = None
+    reason: str
+
+class ApproveResetModel(BaseModel):
+    request_id: Optional[str] = None
+    requestId: Optional[str] = None
+    line_user_id: Optional[str] = None
+    lineUserId: Optional[str] = None
+    userId: Optional[str] = None
+
+class RejectResetModel(BaseModel):
+    requestId: str
+    reason: Optional[str] = None
 
 # Base Configs
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://creative-macaron-98004d.netlify.app")
@@ -250,6 +305,7 @@ def get_onboarding_options():
         "supervisors": supervisors,
         "brands": brands,
         "masterEmployees": available_employees,
+        "employees": available_employees,
         "hasMasterData": len(employees) > 0 and len(supervisors) > 0
     }
 
@@ -266,6 +322,7 @@ def register_onboarding(req: OnboardingRequest):
         "lineUserId": req.lineUserId,
         "displayName": req.displayName or req.fullName,
         "fullName": req.fullName,
+        "department": req.department,
         "brand": req.brand,
         "role": req.role,
         "supervisorId": req.supervisorId,
@@ -278,17 +335,357 @@ def register_onboarding(req: OnboardingRequest):
     return {"success": True, "user": user}
 
 # ---------------------------------------------------------
+# ACCOUNT RESET REQUESTS API (FastAPI + MongoDB)
+# ---------------------------------------------------------
+
+@app.post("/api/request-reset")
+def request_reset(req: ResetRequestModel):
+    """
+    POST /api/request-reset
+    รับข้อมูล: line_user_id (หรือ lineUserId), name (หรือ fullName), brand, reason
+    บันทึกคำขอลงใน collection reset_requests (สถานะ pending)
+    """
+    line_id = req.line_user_id or req.lineUserId
+    name = req.name or req.fullName or "พนักงาน"
+    brand = req.brand or "-"
+    reason = req.reason.strip() if req.reason else ""
+
+    if not line_id:
+        raise HTTPException(status_code=400, detail="กรุณาระบุ line_user_id หรือ lineUserId")
+    if not reason:
+        raise HTTPException(status_code=400, detail="กรุณาระบุเหตุผลในการขอรีเซ็ตบัญชี")
+
+    now_iso = datetime.utcnow().isoformat()
+    req_id = f"rst_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:6]}"
+
+    doc = {
+        "_id": req_id,
+        "id": req_id,
+        "line_user_id": line_id,
+        "lineUserId": line_id,
+        "name": name,
+        "fullName": name,
+        "brand": brand,
+        "department": req.department or "-",
+        "userId": req.userId,
+        "reason": reason,
+        "status": "pending",
+        "createdAt": now_iso,
+        "updatedAt": now_iso
+    }
+
+    # 1. บันทึกลงใน MongoDB collection reset_requests (ถ้าเชื่อมต่อ MongoDB อยู่)
+    if mongo_client and mongo_reset_col is not None:
+        try:
+            existing = mongo_reset_col.find_one({
+                "$or": [{"line_user_id": line_id}, {"lineUserId": line_id}],
+                "status": "pending"
+            })
+            if existing:
+                mongo_reset_col.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {
+                        "name": name,
+                        "fullName": name,
+                        "brand": brand,
+                        "reason": reason,
+                        "updatedAt": now_iso
+                    }}
+                )
+                doc = {**existing, "name": name, "fullName": name, "brand": brand, "reason": reason, "updatedAt": now_iso}
+                doc["_id"] = str(doc["_id"])
+            else:
+                mongo_reset_col.insert_one(doc)
+                doc["_id"] = str(doc["_id"])
+        except Exception as e:
+            print("MongoDB insert reset_requests error:", e)
+
+    # 2. ซิงค์กับ JSON DB เผื่อกรณีรันแบบ Local / Offline
+    db = read_db()
+    if "resetRequests" not in db:
+        db["resetRequests"] = []
+
+    existing_local = next(
+        (r for r in db["resetRequests"] if r.get("status") == "pending" and (
+            r.get("line_user_id") == line_id or r.get("lineUserId") == line_id or (req.userId and r.get("userId") == req.userId)
+        )),
+        None
+    )
+    if existing_local:
+        existing_local["name"] = name
+        existing_local["fullName"] = name
+        existing_local["brand"] = brand
+        existing_local["reason"] = reason
+        existing_local["updatedAt"] = now_iso
+        doc = existing_local
+    else:
+        db["resetRequests"].append(doc)
+
+    write_db(db)
+
+    return {
+        "success": True,
+        "message": "ส่งคำขอรีเซ็ตบัญชีเรียบร้อยแล้ว (สถานะ pending) กรุณารอหัวหน้างานอนุมัติ",
+        "request": doc
+    }
+
+@app.get("/api/reset-requests")
+def get_pending_reset_requests():
+    """
+    GET /api/reset-requests
+    ดึงรายการคำขอรีเซ็ตทั้งหมดที่สถานะเป็น pending ส่งกลับไปให้หน้า Admin Dashboard
+    """
+    if mongo_client and mongo_reset_col is not None:
+        try:
+            cursor = mongo_reset_col.find({"status": "pending"}).sort("createdAt", -1)
+            requests = []
+            for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                requests.append(doc)
+            return {
+                "success": True,
+                "total": len(requests),
+                "pendingCount": len(requests),
+                "requests": requests
+            }
+        except Exception as e:
+            print("MongoDB fetch reset_requests error:", e)
+
+    # Fallback to local DB
+    db = read_db()
+    requests = db.get("resetRequests", [])
+    pending = [r for r in requests if r.get("status") == "pending"]
+    sorted_reqs = sorted(pending, key=lambda x: x.get("createdAt", ""), reverse=True)
+    return {
+        "success": True,
+        "total": len(sorted_reqs),
+        "pendingCount": len(sorted_reqs),
+        "requests": sorted_reqs
+    }
+
+@app.get("/api/admin/reset-requests")
+def get_admin_reset_requests():
+    """
+    GET /api/admin/reset-requests
+    ดึงรายการคำขอทั้งหมดสำหรับหน้า Admin Dashboard
+    """
+    if mongo_client and mongo_reset_col is not None:
+        try:
+            cursor = mongo_reset_col.find({}).sort("createdAt", -1)
+            requests = []
+            for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                requests.append(doc)
+            pending_count = sum(1 for r in requests if r.get("status") == "pending")
+            return {
+                "success": True,
+                "total": len(requests),
+                "pendingCount": pending_count,
+                "requests": requests
+            }
+        except Exception as e:
+            print("MongoDB fetch admin reset requests error:", e)
+
+    db = read_db()
+    requests = db.get("resetRequests", [])
+    sorted_reqs = sorted(requests, key=lambda x: x.get("createdAt", ""), reverse=True)
+    pending_count = sum(1 for r in sorted_reqs if r.get("status") == "pending")
+    return {
+        "success": True,
+        "total": len(sorted_reqs),
+        "pendingCount": pending_count,
+        "requests": sorted_reqs
+    }
+
+@app.get("/api/reset-status")
+def get_reset_status(lineUserId: Optional[str] = None, line_user_id: Optional[str] = None, userId: Optional[str] = None):
+    line_id = line_user_id or lineUserId
+
+    if mongo_client and mongo_reset_col is not None and line_id:
+        try:
+            matched = list(mongo_reset_col.find({
+                "$or": [{"line_user_id": line_id}, {"lineUserId": line_id}]
+            }).sort("createdAt", -1))
+            if matched:
+                latest = matched[0]
+                latest["_id"] = str(latest["_id"])
+                return {
+                    "hasPending": latest.get("status") == "pending",
+                    "status": latest.get("status"),
+                    "request": latest
+                }
+        except Exception as e:
+            print("MongoDB get_reset_status error:", e)
+
+    db = read_db()
+    requests = db.get("resetRequests", [])
+    matched = [r for r in requests if (line_id and (r.get("lineUserId") == line_id or r.get("line_user_id") == line_id)) or (userId and r.get("userId") == userId)]
+    if not matched:
+        return {"hasPending": False, "status": "none", "request": None}
+
+    latest = sorted(matched, key=lambda x: x.get("createdAt", ""), reverse=True)[0]
+    return {
+        "hasPending": latest.get("status") == "pending",
+        "status": latest.get("status"),
+        "request": latest
+    }
+
+@app.post("/api/approve-reset")
+@app.post("/api/admin/approve-reset")
+def approve_reset(req: ApproveResetModel):
+    """
+    POST /api/approve-reset
+    รับค่า request_id หรือ line_user_id
+    เมื่อหัวหน้ากดอนุมัติ ให้ลบหรือรีเซ็ตข้อมูลการลงทะเบียนของ LINE ID นั้นในตารางผู้ใช้
+    อัปเดตสถานะคำขอใน reset_requests เป็น approved
+    """
+    req_id = req.request_id or req.requestId
+    line_id = req.line_user_id or req.lineUserId
+    user_id = req.userId
+
+    if not req_id and not line_id and not user_id:
+        raise HTTPException(status_code=400, detail="กรุณาระบุ request_id หรือ line_user_id")
+
+    now_iso = datetime.utcnow().isoformat()
+    emp_name = None
+
+    # 1. ดำเนินการใน MongoDB (ถ้าเชื่อมต่ออยู่)
+    if mongo_client and mongo_reset_col is not None:
+        try:
+            query = {}
+            if req_id:
+                query = {"$or": [{"_id": req_id}, {"id": req_id}]}
+            elif line_id:
+                query = {"$or": [{"line_user_id": line_id}, {"lineUserId": line_id}], "status": "pending"}
+
+            target_doc = mongo_reset_col.find_one(query)
+            if target_doc:
+                line_id = target_doc.get("line_user_id") or target_doc.get("lineUserId") or line_id
+                emp_name = target_doc.get("name") or target_doc.get("fullName")
+
+                # อัปเดตสถานะคำขอใน reset_requests เป็น approved
+                mongo_reset_col.update_one(
+                    {"_id": target_doc["_id"]},
+                    {"$set": {
+                        "status": "approved",
+                        "approvedAt": now_iso,
+                        "updatedAt": now_iso
+                    }}
+                )
+
+            # ลบหรือรีเซ็ตข้อมูลการลงทะเบียนของ LINE ID นั้นในตารางผู้ใช้
+            if line_id:
+                # ลบออกจาก main_data (collection หลัก)
+                mongo_collection.update_one(
+                    {"_id": "main_db"},
+                    {"$pull": {
+                        "users": {
+                            "$or": [
+                                {"lineUserId": line_id},
+                                {"line_user_id": line_id}
+                            ]
+                        }
+                    }}
+                )
+                # ลบออกจาก collection users (ถ้ามี)
+                try:
+                    mongo_db["users"].delete_many({
+                        "$or": [
+                            {"lineUserId": line_id},
+                            {"line_user_id": line_id}
+                        ]
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            print("MongoDB approve_reset error:", e)
+
+    # 2. ซิงค์กับ JSON DB เผื่อกรณีรันแบบ Local / Offline
+    db = read_db()
+    users = db.get("users", [])
+    for u in users:
+        if (line_id and (u.get("lineUserId") == line_id or u.get("line_user_id") == line_id)) or (user_id and u.get("id") == user_id):
+            if not emp_name:
+                emp_name = u.get("fullName") or u.get("name")
+            break
+
+    # ล้างข้อมูลการลงทะเบียนของผู้ใช้เพื่อให้สามารถเข้าสู่ระบบและลงทะเบียนใหม่ได้
+    db["users"] = [
+        u for u in users
+        if not (
+            (line_id and (u.get("lineUserId") == line_id or u.get("line_user_id") == line_id)) or
+            (user_id and u.get("id") == user_id)
+        )
+    ]
+
+    # อัปเดตสถานะใน resetRequests
+    requests = db.get("resetRequests", [])
+    for r in requests:
+        is_match = False
+        if req_id and (r.get("id") == req_id or r.get("_id") == req_id):
+            is_match = True
+        elif line_id and (r.get("lineUserId") == line_id or r.get("line_user_id") == line_id) and r.get("status") == "pending":
+            is_match = True
+        elif user_id and r.get("userId") == user_id and r.get("status") == "pending":
+            is_match = True
+
+        if is_match:
+            r["status"] = "approved"
+            r["approvedAt"] = now_iso
+            r["updatedAt"] = now_iso
+
+    write_db(db)
+
+    return {
+        "success": True,
+        "message": f"อนุมัติการรีเซ็ตบัญชีของ {emp_name or 'พนักงาน'} เรียบร้อยแล้ว (สถานะ approved) พนักงานสามารถลงทะเบียนใหม่ได้ทันที"
+    }
+
+@app.post("/api/admin/reject-reset")
+def reject_reset(req: RejectResetModel):
+    now_iso = datetime.utcnow().isoformat()
+    if mongo_client and mongo_reset_col is not None:
+        try:
+            mongo_reset_col.update_one(
+                {"$or": [{"_id": req.requestId}, {"id": req.requestId}]},
+                {"$set": {
+                    "status": "rejected",
+                    "rejectReason": req.reason or "ไม่อนุมัติ",
+                    "rejectedAt": now_iso,
+                    "updatedAt": now_iso
+                }}
+            )
+        except Exception as e:
+            print("MongoDB reject_reset error:", e)
+
+    db = read_db()
+    requests = db.get("resetRequests", [])
+    target = next((r for r in requests if r.get("id") == req.requestId or r.get("_id") == req.requestId), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="ไม่พบรายการคำขอ")
+
+    target["status"] = "rejected"
+    target["rejectReason"] = req.reason or "ไม่อนุมัติ"
+    target["rejectedAt"] = now_iso
+    target["updatedAt"] = now_iso
+    write_db(db)
+    return {"success": True, "message": "ปฏิเสธคำขอรีเซ็ตเรียบร้อยแล้ว"}
+
+# ---------------------------------------------------------
 # ADMIN MASTER DATA UPLOAD & STATUS DASHBOARD
 # ---------------------------------------------------------
 
 @app.post("/api/admin/upload-master-data")
-async def upload_master_data(file: UploadFile = File(...)):
+async def upload_master_data(
+    file: UploadFile = File(...),
+    minStaffThreshold: Optional[int] = Form(2)
+):
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์ Excel (.xlsx)")
 
     content = await file.read()
-    wb = openpyxl.load_workbook(filename=io.BytesIO(content))
-    ws = wb.active
+    threshold = minStaffThreshold if minStaffThreshold is not None else 2
+    res = process_master_data_excel(content, min_staff_threshold=threshold)
 
     db = read_db()
     existing_employees = db.get("employees", [])
@@ -297,46 +694,49 @@ async def upload_master_data(file: UploadFile = File(...)):
     added_emp_count = 0
     added_brand_count = 0
 
-    name_col = 1
-    brand_col = 2
-
-    for c in range(1, ws.max_column + 1):
-        val = str(ws.cell(row=1, column=c).value or "").strip().lower()
-        if "ชื่อ" in val or "name" in val:
-            name_col = c
-        elif "แบรนด์" in val or "brand" in val:
-            brand_col = c
-
-    for r in range(2, ws.max_row + 1):
-        emp_name = str(ws.cell(row=r, column=name_col).value or "").strip()
-        brand_name = str(ws.cell(row=r, column=brand_col).value or "").strip()
+    for idx, emp in enumerate(res.get("employees", [])):
+        emp_name = emp.get("name")
+        brand_name = emp.get("brand")
+        requires_shift = emp.get("requires_shift_selection", False)
 
         if emp_name:
-            if not any(e["name"] == emp_name for e in existing_employees):
+            found_emp = next((e for e in existing_employees if e.get("name") == emp_name), None)
+            if not found_emp:
                 existing_employees.append({
-                    "id": f"emp_{int(datetime.utcnow().timestamp())}_{r}",
+                    "id": f"emp_{int(datetime.utcnow().timestamp())}_{idx}",
                     "name": emp_name,
-                    "brand": brand_name or "General"
+                    "brand": brand_name or "General",
+                    "requiresShiftSelection": requires_shift
                 })
                 added_emp_count += 1
+            else:
+                found_emp["brand"] = brand_name
+                found_emp["requiresShiftSelection"] = requires_shift
 
         if brand_name:
-            if not any(b["name"] == brand_name for b in existing_brands):
+            if not any(b.get("name") == brand_name for b in existing_brands):
                 existing_brands.append({
-                    "id": f"b_{int(datetime.utcnow().timestamp())}_{r}",
+                    "id": f"b_{int(datetime.utcnow().timestamp())}_{idx}",
                     "name": brand_name
                 })
                 added_brand_count += 1
 
     db["employees"] = existing_employees
     db["brands"] = existing_brands
+    db["remarks"] = res.get("remarks", [])
+    db["brandCounts"] = res.get("brand_counts", {})
     write_db(db)
+
+    total_emp = res.get("total_employees", len(existing_employees))
 
     return {
         "success": True,
-        "message": f"นำเข้าข้อมูลสำเร็จ: เพิ่มพนักงาน {added_emp_count} คน, เพิ่มแบรนด์ {added_brand_count} แบรนด์",
+        "message": f"นำเข้าข้อมูลสำเร็จ: พบพนักงานทั้งหมด {total_emp} คน (เพิ่มใหม่ {added_emp_count} คน), เพิ่มแบรนด์ใหม่ {added_brand_count} แบรนด์",
+        "totalEmployees": total_emp,
         "addedEmployees": added_emp_count,
-        "addedBrands": added_brand_count
+        "addedBrands": added_brand_count,
+        "brandCounts": res.get("brand_counts", {}),
+        "remarks": res.get("remarks", [])
     }
 
 @app.get("/api/admin/submission-status")
