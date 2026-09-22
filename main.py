@@ -33,19 +33,9 @@ if not os.path.exists(SAMPLE_TEMPLATE_PATH):
 
 INITIAL_DB = {
     "brands": [],
+    "departments": [],
     "employees": [],
-    "users": [
-        {
-            "id": "usr_admin",
-            "lineUserId": "U_ADMIN_DEMO",
-            "displayName": "ดารินทร์ สุขใจ (Admin)",
-            "fullName": "ดารินทร์ สุขใจ",
-            "brand": "สำนักงานใหญ่",
-            "role": "admin",
-            "hasCompletedOnboarding": True,
-            "createdAt": datetime.utcnow().isoformat()
-        }
-    ],
+    "users": [],
     "cutoffs": [
         {
             "id": "cut_2026_09_1",
@@ -146,6 +136,7 @@ class LeaveSubmitRequest(BaseModel):
 class ExcelProcessRequest(BaseModel):
     yearMonth: str
     period: Optional[str] = "1-15"
+    department: Optional[str] = None
 
 class BrandRequest(BaseModel):
     name: str
@@ -294,19 +285,35 @@ def login_line(req: LineLoginRequest):
 def get_onboarding_options():
     db = read_db()
     users = db.get("users", [])
-    supervisors = [{"id": u["id"], "fullName": u["fullName"]} for u in users if u.get("role") == "admin"]
+    supervisors = [
+        {"id": u.get("id"), "fullName": u.get("fullName") or u.get("displayName")}
+        for u in users
+        if u.get("role") == "admin" and "ดารินทร์ สุขใจ" not in (u.get("fullName") or "")
+    ]
     brands = db.get("brands", [])
     employees = db.get("employees", [])
     
+    # ดึงรายชื่อแผนกจริงที่ไม่ซ้ำกันจากฐานข้อมูลและพนักงาน
+    dept_set = set()
+    for e in employees:
+        d = e.get("department")
+        if d and isinstance(d, str) and d.strip():
+            dept_set.add(d.strip())
+    for d in db.get("departments", []):
+        if d and isinstance(d, str) and d.strip():
+            dept_set.add(d.strip())
+    departments = sorted(list(dept_set))
+
     claimed_names = set(u.get("fullName") for u in users if u.get("role") == "staff")
     available_employees = [e for e in employees if e.get("name") not in claimed_names]
 
     return {
         "supervisors": supervisors,
         "brands": brands,
+        "departments": departments,
         "masterEmployees": available_employees,
         "employees": available_employees,
-        "hasMasterData": len(employees) > 0 and len(supervisors) > 0
+        "hasMasterData": len(employees) > 0
     }
 
 @app.post("/api/auth/register-onboarding")
@@ -697,6 +704,7 @@ async def upload_master_data(
     for idx, emp in enumerate(res.get("employees", [])):
         emp_name = emp.get("name")
         brand_name = emp.get("brand")
+        dept_name = (emp.get("department") or "").strip()
         requires_shift = emp.get("requires_shift_selection", False)
 
         if emp_name:
@@ -706,11 +714,14 @@ async def upload_master_data(
                     "id": f"emp_{int(datetime.utcnow().timestamp())}_{idx}",
                     "name": emp_name,
                     "brand": brand_name or "General",
+                    "department": dept_name,
                     "requiresShiftSelection": requires_shift
                 })
                 added_emp_count += 1
             else:
                 found_emp["brand"] = brand_name
+                if dept_name:
+                    found_emp["department"] = dept_name
                 found_emp["requiresShiftSelection"] = requires_shift
 
         if brand_name:
@@ -720,6 +731,17 @@ async def upload_master_data(
                     "name": brand_name
                 })
                 added_brand_count += 1
+
+    # ซิงค์รายชื่อแผนกทั้งหมดลงฐานข้อมูล
+    dept_set = set(d for d in db.get("departments", []) if d)
+    for emp_item in existing_employees:
+        d = emp_item.get("department")
+        if d and isinstance(d, str) and d.strip():
+            dept_set.add(d.strip())
+    for d in res.get("departments", []):
+        if d and isinstance(d, str) and d.strip():
+            dept_set.add(d.strip())
+    db["departments"] = sorted(list(dept_set))
 
     db["employees"] = existing_employees
     db["brands"] = existing_brands
@@ -731,10 +753,11 @@ async def upload_master_data(
 
     return {
         "success": True,
-        "message": f"นำเข้าข้อมูลสำเร็จ: พบพนักงานทั้งหมด {total_emp} คน (เพิ่มใหม่ {added_emp_count} คน), เพิ่มแบรนด์ใหม่ {added_brand_count} แบรนด์",
+        "message": f"นำเข้าข้อมูลสำเร็จ: พบพนักงานทั้งหมด {total_emp} คน (เพิ่มใหม่ {added_emp_count} คน), เพิ่มแบรนด์ใหม่ {added_brand_count} แบรนด์, {len(db['departments'])} แผนก",
         "totalEmployees": total_emp,
         "addedEmployees": added_emp_count,
         "addedBrands": added_brand_count,
+        "departments": db["departments"],
         "brandCounts": res.get("brand_counts", {}),
         "remarks": res.get("remarks", [])
     }
@@ -879,9 +902,25 @@ async def upload_template(templateFile: UploadFile = File(...)):
 def process_excel(req: ExcelProcessRequest):
     global active_template_file
     db = read_db()
+    users = db.get("users", [])
+    employees = db.get("employees", [])
+
+    allowed_names = set()
+    if req.department:
+        for u in users:
+            if u.get("department") == req.department:
+                if u.get("fullName"):
+                    allowed_names.add(u.get("fullName").strip())
+        for e in employees:
+            if e.get("department") == req.department:
+                if e.get("name"):
+                    allowed_names.add(e.get("name").strip())
+
     records = [
         r for r in db.get("leaveRecords", [])
-        if r.get("yearMonth") == req.yearMonth and (not req.period or r.get("period") == req.period)
+        if r.get("yearMonth") == req.yearMonth 
+        and (not req.period or r.get("period") == req.period)
+        and (not req.department or (r.get("userName") and r.get("userName").strip() in allowed_names))
     ]
 
     try:
@@ -891,7 +930,8 @@ def process_excel(req: ExcelProcessRequest):
             period=req.period
         )
 
-        filename = f"Leave_Schedule_{req.yearMonth}_{req.period or 'All'}.xlsx"
+        dept_suffix = f"_{req.department}" if req.department else ""
+        filename = f"Leave_Schedule_{req.yearMonth}_{req.period or 'All'}{dept_suffix}.xlsx"
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Updated-Cells-Count": str(updated_count),
