@@ -732,16 +732,19 @@ async def upload_master_data(
                 })
                 added_brand_count += 1
 
-    # ซิงค์รายชื่อแผนกทั้งหมดลงฐานข้อมูล
-    dept_set = set(d for d in db.get("departments", []) if d)
+    # ซิงค์รายชื่อแผนกทั้งหมดลงฐานข้อมูล (เรียงตามลำดับที่ตรวจพบ)
+    dept_list = []
+    for d in res.get("departments", []):
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
     for emp_item in existing_employees:
         d = emp_item.get("department")
-        if d and isinstance(d, str) and d.strip():
-            dept_set.add(d.strip())
-    for d in res.get("departments", []):
-        if d and isinstance(d, str) and d.strip():
-            dept_set.add(d.strip())
-    db["departments"] = sorted(list(dept_set))
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
+    for d in db.get("departments", []):
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
+    db["departments"] = dept_list
 
     db["employees"] = existing_employees
     db["brands"] = existing_brands
@@ -763,7 +766,12 @@ async def upload_master_data(
     }
 
 @app.get("/api/admin/submission-status")
-def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supervisorId: Optional[str] = None):
+def get_submission_status(
+    yearMonth: str = "2026-09",
+    period: str = "1-15",
+    supervisorId: Optional[str] = None,
+    department: Optional[str] = None
+):
     db = read_db()
     users = db.get("users", [])
     leave_records = db.get("leaveRecords", [])
@@ -771,6 +779,8 @@ def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supe
     staff_users = [u for u in users if u.get("role") == "staff"]
     if supervisorId:
         staff_users = [u for u in staff_users if u.get("supervisorId") == supervisorId]
+    if department and department != "ALL":
+        staff_users = [u for u in staff_users if (u.get("department") or "").strip() == department.strip()]
 
     submitted_user_ids = set(
         r.get("userId") for r in leave_records
@@ -785,6 +795,7 @@ def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supe
             "userId": u.get("id"),
             "fullName": u.get("fullName"),
             "brand": u.get("brand"),
+            "department": u.get("department") or "-",
             "supervisorName": u.get("supervisorName", "-")
         }
         if u.get("id") in submitted_user_ids:
@@ -804,6 +815,19 @@ def get_submission_status(yearMonth: str = "2026-09", period: str = "1-15", supe
 # CUTOFFS & LEAVE RECORDS
 # ---------------------------------------------------------
 
+@app.get("/api/departments")
+def get_departments():
+    db = read_db()
+    dept_list = []
+    for d in db.get("departments", []):
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
+    for e in db.get("employees", []):
+        d = e.get("department")
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
+    return {"departments": dept_list}
+
 @app.get("/api/brands")
 def get_brands():
     db = read_db()
@@ -812,7 +836,18 @@ def get_brands():
 @app.get("/api/employees")
 def get_employees():
     db = read_db()
-    return {"employees": db.get("employees", [])}
+    dept_list = []
+    for d in db.get("departments", []):
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
+    for e in db.get("employees", []):
+        d = e.get("department")
+        if d and isinstance(d, str) and d.strip() and d.strip() not in dept_list:
+            dept_list.append(d.strip())
+    return {
+        "employees": db.get("employees", []),
+        "departments": dept_list
+    }
 
 @app.get("/api/cutoffs")
 def get_cutoffs():
