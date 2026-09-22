@@ -1,7 +1,34 @@
 import io
 import os
+import re
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+def clean_dept_name(text: str) -> str:
+    """ตัดเครื่องหมายขีด (-) ออก และจัดช่องว่างให้เรียบร้อย"""
+    if not text:
+        return ""
+    cleaned = str(text).replace('-', '').strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return cleaned.strip()
+
+def clean_brand_text(text: str) -> str:
+    """ตัดคำนำหน้า แบรนด์:, แบรนด์ :, Brand: ออกให้สะอาด"""
+    if not text:
+        return ""
+    cleaned = str(text).strip()
+    cleaned = re.sub(r'^(แบรนด์\s*/?\s*สาขา\s*[:：]?\s*|แบรนด์\s*[:：]?\s*|brand\s*[:：]?\s*)', '', cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.strip('-').strip()
+    return cleaned
+
+def clean_name_text(text: str) -> str:
+    """ตัดคำนำหน้า ชื่อ-นามสกุล:, ชื่อ-สกุล:, ชื่อพนักงาน:, ชื่อ:, Name:, Fullname: ออกให้สะอาด"""
+    if not text:
+        return ""
+    cleaned = str(text).strip()
+    cleaned = re.sub(r'^(ชื่อ\s*[-–—]\s*นามสกุล\s*[:：]?\s*|ชื่อ\s*[-–—]\s*สกุล\s*[:：]?\s*|ชื่อพนักงาน\s*[:：]?\s*|ชื่อ\s*[:：]?\s*|fullname\s*[:：]?\s*|name\s*[:：]?\s*)', '', cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.strip('-').strip()
+    return cleaned
 
 def create_sample_template(file_path: str):
     wb = openpyxl.Workbook()
@@ -115,9 +142,12 @@ def process_excel_template(template_path: str, leave_records: list, period: str 
         for c in range(1, min(ws.max_column + 1, 10)):
             val = ws.cell(row=r, column=c).value
             if val and isinstance(val, str):
-                clean_name = val.strip()
-                if len(clean_name) >= 3 and clean_name not in emp_row_map:
+                raw_name = val.strip()
+                clean_name = clean_name_text(raw_name)
+                if len(clean_name) >= 2 and clean_name not in emp_row_map:
                     emp_row_map[clean_name] = r
+                if len(raw_name) >= 2 and raw_name not in emp_row_map:
+                    emp_row_map[raw_name] = r
 
     # 3. Fill Leave Codes
     updated_count = 0
@@ -144,11 +174,13 @@ def process_excel_template(template_path: str, leave_records: list, period: str 
             continue
 
         rec_name = (rec.get('userName') or '').strip()
-        target_row = emp_row_map.get(rec_name)
+        rec_clean_name = clean_name_text(rec_name)
+        target_row = emp_row_map.get(rec_clean_name) or emp_row_map.get(rec_name)
 
-        if not target_row and rec_name:
+        if not target_row and (rec_clean_name or rec_name):
+            search_key = rec_clean_name or rec_name
             for k, r_idx in emp_row_map.items():
-                if rec_name in k or k in rec_name:
+                if search_key in k or k in search_key:
                     target_row = r_idx
                     break
 
@@ -169,111 +201,119 @@ def process_excel_template(template_path: str, leave_records: list, period: str 
 
 def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2):
     """
-    ฟังก์ชันสำหรับอ่านไฟล์ Excel อัจฉริยะ (รองรับการอ่านทุก Sheet)
-    ดึงชื่อ แบรนด์ ดึงหมายเหตุ/กะการทำงาน และเช็คเงื่อนไขแบรนด์ที่มีพนักงาน > min_staff_threshold
-    พร้อมระบบป้องกัน Error กรณีแถวว่างหรือโครงสร้างคอลัมน์ไม่แน่นอน
+    ฟังก์ชันสำหรับอ่านไฟล์ Excel อัจฉริยะ (รองรับทุก Sheet และรองรับหลายแผนกแทรกใน Sheet เดียวกัน)
+    - ตรวจจับแถวแผนก เช่น '--- แผนก 101 :PRESTIGE ชั้น 1 ---' (Col A มีคำว่าแผนก, Col B ว่างเปล่า)
+    - ผูกฟิลด์ department เข้ากับพนักงานในแผนกนั้นๆ อย่างถูกต้อง
+    - ตัดคำนำหน้า 'แบรนด์:' และ 'ชื่อ-นามสกุล:' ออกให้สะอาด
+    - รวบรวมรายชื่อแผนกทั้งหมด และนับจำนวนคนในแบรนด์
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_content), data_only=True)
     
     all_employees = []
     brand_counts = {}
     remarks = []
+    departments_list = []
 
-    # คีย์เวิร์ดสำหรับตรวจจับคอลัมน์และหัวตาราง
-    NAME_KEYWORDS = ["ชื่อ-นามสกุล", "ชื่อ - นามสกุล", "ชื่อ-สกุล", "ชื่อพนักงาน", "ชื่อ", "FULLNAME", "NAME"]
-    BRAND_KEYWORDS = ["แบรนด์ / สาขา", "แบรนด์/สาขา", "แบรนด์", "สาขา", "BRAND"]
-    DEPT_KEYWORDS = ["แผนก", "ฝ่าย", "สังกัด", "สายงาน", "DEPARTMENT", "DEPT", "SECTION"]
-    STOP_KEYWORDS = ["สรุปจำนวน", "รวมทั้งสิ้น", "สรุปยอด", "ยอดรวม", "TOTAL", "หมายเหตุ"]
+    DEPT_KEYWORDS = ["แผนก", "ฝ่าย", "DEPARTMENT", "SECTION"]
+    STOP_KEYWORDS = ["สรุปจำนวน", "รวมทั้งสิ้น", "สรุปยอด", "ยอดรวม", "TOTAL"]
     SHIFT_KEYWORDS = ["คำอธิบายสัญลักษณ์", "ช่วงเวลาปฏิบัติ", "เวลาปฏิบัติงาน", "เวลาทำงาน", "กะการทำงาน", "กะ ", "กะเช้า", "กะบ่าย", "กะดึก", "W =", "C =", "V =", "S =", "N =", "OFF"]
 
     # 1. วนลูปอ่านข้อมูล "ทุก Sheet" ในไฟล์
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
-        header_row_index = None
-        brand_col_idx = 0
-        name_col_idx = 1
-        dept_col_idx = None
-        
-        # 2. ค้นหาบรรทัดที่เป็น "หัวตารางที่แท้จริง" (สแกน 25 บรรทัดแรก)
-        for i, row in enumerate(sheet.iter_rows(min_row=1, max_row=25, values_only=True), start=1):
-            if not row:
-                continue
-            row_texts = [str(cell).strip() if cell is not None else "" for cell in row]
-            
-            # ตรวจสอบว่ามีคอลัมน์ชื่อ และ คอลัมน์แบรนด์ ในแถวเดียวกันหรือไม่
-            has_name = any(any(k in text.upper() for k in NAME_KEYWORDS) for text in row_texts)
-            has_brand = any(any(k in text.upper() for k in BRAND_KEYWORDS) for text in row_texts)
+        current_dept = None
 
-            if has_name and has_brand:
-                header_row_index = i
-                for col_idx, text in enumerate(row_texts):
-                    text_upper = text.upper()
-                    if any(k in text_upper for k in BRAND_KEYWORDS):
-                        brand_col_idx = col_idx
-                    elif any(k in text_upper for k in NAME_KEYWORDS):
-                        name_col_idx = col_idx
-                    elif any(k in text_upper for k in DEPT_KEYWORDS):
-                        dept_col_idx = col_idx
-                break
-                
-        # หาก Sheet ไหนไม่ใช่ตารางรายชื่อ ให้ข้ามไป Sheet ถัดไป
-        if header_row_index is None:
-            continue
-            
-        # ค้นหาชื่อแผนกจริงจากส่วนหัวของ Sheet (เช่น ข้อความ 'แผนก 101 :PRESTIGE ชั้น 1' ในแถว 1-15)
-        sheet_department = None
-        for r_idx in range(1, min(20, sheet.max_row + 1)):
-            for c_idx in range(1, min(sheet.max_column + 1, 35)):
-                val = sheet.cell(row=r_idx, column=c_idx).value
-                if val is not None:
-                    val_clean = str(val).strip()
-                    val_upper = val_clean.upper()
-                    # ตรวจจับข้อความแผนก เช่น "แผนก 101 :PRESTIGE ชั้น 1" หรือ "ฝ่าย..." หรือ "DEPARTMENT"
-                    if any(k in val_upper for k in ["แผนก", "ฝ่าย", "DEPARTMENT", "SECTION"]):
-                        # หลีกเลี่ยงกรณีที่เป็นแค่ชื่อหัวคอลัมน์คำเดียว
-                        if len(val_clean) > 3 and not any(stop in val_upper for stop in STOP_KEYWORDS):
-                            sheet_department = val_clean
-                            break
-            if sheet_department:
-                break
-                
-        # หากไม่พบในเซลล์หัวตาราง ให้ตรวจว่าชื่อ Sheet เป็นชื่อแผนกหรือไม่
-        if not sheet_department:
-            sheet_department = sheet_name.strip()
-            
-        # 3. เริ่มดึงข้อมูลพนักงาน (อ่านต่อจากบรรทัดหัวตารางลงมา)
-        for row in sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
+        # กรณีชื่อชีตมีชื่อแผนกอยู่ ใช้เป็น fallback
+        fallback_dept = None
+        if any(k in sheet_name.upper() for k in DEPT_KEYWORDS):
+            fallback_dept = clean_dept_name(sheet_name)
+
+        # 2. วนลูปอ่านแถวทีละแถวตั้งแต่บรรทัดแรกจนถึงบรรทัดสุดท้าย
+        for row in sheet.iter_rows(values_only=True):
             if not row:
                 continue
 
-            # ตรวจหาจุดสิ้นสุดของรายชื่อพนักงาน
-            row_sample_str = " ".join([str(c).strip() for c in row[:5] if c is not None])
+            # แปลงค่าในแต่ละเซลล์เป็นสตริงเพื่อตรวจจับ
+            row_texts = [str(c).strip() if c is not None else "" for c in row]
+            if not any(row_texts):
+                # แถวว่างเปล่าคั่นระหว่างกลุ่ม/แผนก ให้ข้ามไปแถวถัดไป (ห้าม break หลุดลูป)
+                continue
+
+            col_a_raw = row_texts[0] if len(row_texts) > 0 else ""
+            col_b_raw = row_texts[1] if len(row_texts) > 1 else ""
+
+            # ข้ามแถวสรุปยอดรวม (เช่น 'รวมทั้งสิ้น ...')
+            row_sample_str = " ".join(row_texts[:5])
             if any(stop_word in row_sample_str for stop_word in STOP_KEYWORDS):
-                break
-                
-            col_brand = str(row[brand_col_idx]).strip() if len(row) > brand_col_idx and row[brand_col_idx] is not None else ""
-            col_name = str(row[name_col_idx]).strip() if len(row) > name_col_idx and row[name_col_idx] is not None else ""
-            col_dept = str(row[dept_col_idx]).strip() if dept_col_idx is not None and len(row) > dept_col_idx and row[dept_col_idx] is not None else ""
-            
-            # ตรวจเช็คว่าบรรทัดนี้เป็นคำสรุปหรือไม่
-            if any(stop_word in col_brand for stop_word in STOP_KEYWORDS) or any(stop_word in col_name for stop_word in STOP_KEYWORDS):
-                break
+                continue
 
-            final_dept = col_dept if (col_dept and col_dept.upper() not in ["NONE", "NULL", "-"]) else sheet_department
+            # -------------------------------------------------------------
+            # ก) ตรวจจับแถวหัวข้อแผนก:
+            # Col A มีคำว่า "แผนก" (หรือ "ฝ่าย", "DEPARTMENT")
+            # และ Col B ว่างเปล่า หรือไม่มีชื่อพนักงาน (หรือเป็น None / -)
+            # -------------------------------------------------------------
+            is_dept_header = False
+            col_a_upper = col_a_raw.upper()
+            if any(k in col_a_upper for k in DEPT_KEYWORDS):
+                b_name_clean = clean_name_text(col_b_raw)
+                if not col_b_raw or col_b_raw.upper() in ["NONE", "NULL", "-"] or not b_name_clean:
+                    is_dept_header = True
 
-            # ถ้ามีข้อมูลครบทั้ง Brand และ ชื่อ และไม่ใช่ค่าว่าง/NONE ให้เก็บลงระบบ
-            if col_brand and col_name and col_brand.upper() not in ["NONE", "NULL", "-"] and col_name.upper() not in ["NONE", "NULL", "-"]:
-                # ป้องกันเก็บซ้ำใน Sheet เดียวกัน
+            if is_dept_header:
+                parsed_dept = clean_dept_name(col_a_raw)
+                if parsed_dept and len(parsed_dept) >= 2:
+                    current_dept = parsed_dept
+                    if current_dept not in departments_list:
+                        departments_list.append(current_dept)
+                continue
+
+            # -------------------------------------------------------------
+            # ข) ตรวจจับแถวพนักงาน:
+            # Col A มีแบรนด์ (เช่น 'แบรนด์: MAC '), Col B มีชื่อคน (เช่น ' ชื่อ-นามสกุล: กัณฐมณี')
+            # -------------------------------------------------------------
+            brand_val = clean_brand_text(col_a_raw)
+            name_val = clean_name_text(col_b_raw)
+
+            # ข้ามแถวหัวคอลัมน์ทั่วไป (เช่น 'แบรนด์ / สาขา' | 'ชื่อ-นามสกุล')
+            is_generic_header = (
+                col_a_raw in ["แบรนด์ / สาขา", "แบรนด์/สาขา", "แบรนด์", "สาขา", "BRAND"] or
+                col_b_raw in ["ชื่อ-นามสกุล", "ชื่อ - นามสกุล", "ชื่อ-สกุล", "ชื่อพนักงาน", "ชื่อ", "FULLNAME", "NAME"]
+            )
+            if is_generic_header:
+                continue
+
+            # ถ้าพบทั้งแบรนด์และชื่อพนักงาน
+            if brand_val and name_val and brand_val.upper() not in ["NONE", "NULL", "-"] and name_val.upper() not in ["NONE", "NULL", "-"]:
+                assigned_dept = current_dept or fallback_dept or sheet_name.strip()
                 all_employees.append({
-                    "name": col_name, 
-                    "brand": col_brand,
-                    "department": final_dept
+                    "name": name_val,
+                    "brand": brand_val,
+                    "department": assigned_dept
                 })
-                # นับจำนวนคนในแบรนด์ เพื่อเอาไปคำนวณสิทธิ์เลือกกะ
-                brand_counts[col_brand] = brand_counts.get(col_brand, 0) + 1
-                
-        # 4. ดึงข้อมูล "หมายเหตุ" และ "กะการทำงาน" จากตาราง
-        for row in sheet.iter_rows(min_row=1, values_only=True):
+                brand_counts[brand_val] = brand_counts.get(brand_val, 0) + 1
+                if assigned_dept and assigned_dept not in departments_list:
+                    departments_list.append(assigned_dept)
+                continue
+
+            # เผื่อกรณีตารางมีคอลัมน์คั่น เช่น Col A = ลำดับ, Col B = แบรนด์, Col C = ชื่อ
+            if len(row_texts) > 2:
+                col_c_raw = row_texts[2]
+                alt_brand = clean_brand_text(col_b_raw)
+                alt_name = clean_name_text(col_c_raw)
+                if alt_brand and alt_name and alt_brand.upper() not in ["NONE", "NULL", "-"] and alt_name.upper() not in ["NONE", "NULL", "-"]:
+                    assigned_dept = current_dept or fallback_dept or sheet_name.strip()
+                    all_employees.append({
+                        "name": alt_name,
+                        "brand": alt_brand,
+                        "department": assigned_dept
+                    })
+                    brand_counts[alt_brand] = brand_counts.get(alt_brand, 0) + 1
+                    if assigned_dept and assigned_dept not in departments_list:
+                        departments_list.append(assigned_dept)
+                    continue
+
+        # 3. ดึงข้อมูล "หมายเหตุ" และ "กะการทำงาน" จากชีต
+        for row in sheet.iter_rows(values_only=True):
             if not row:
                 continue
             for cell in row:
@@ -282,15 +322,21 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
                     if cell_str and any(k in cell_str for k in SHIFT_KEYWORDS):
                         if cell_str not in remarks:
                             remarks.append(cell_str)
-                    
-    # 5. กำหนดสิทธิ์เลือกกะ: แบรนด์ไหนมีพนักงานมากกว่าเกณฑ์ (min_staff_threshold)
+
+    # 4. กำหนดสิทธิ์เลือกกะ: แบรนด์ไหนมีพนักงานมากกว่าเกณฑ์ (min_staff_threshold)
     for emp in all_employees:
         emp["requires_shift_selection"] = brand_counts.get(emp["brand"], 0) > min_staff_threshold
 
-    # 6. รวบรวมรายชื่อแผนกที่ไม่ซ้ำกันทั้งหมด
-    unique_departments = list(dict.fromkeys(emp["department"] for emp in all_employees if emp.get("department")))
+    # 5. รวบรวมรายชื่อแผนกที่ไม่ซ้ำกันทั้งหมด (คงลำดับที่พบก่อนหลัง)
+    unique_departments = []
+    for d in departments_list:
+        if d and d not in unique_departments:
+            unique_departments.append(d)
+    for emp in all_employees:
+        d = emp.get("department")
+        if d and d not in unique_departments:
+            unique_departments.append(d)
 
-    # ส่งข้อมูลทั้งหมดกลับไปให้ระบบ API 
     return {
         "total_employees": len(all_employees),
         "employees": all_employees,
@@ -298,5 +344,3 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
         "brand_counts": brand_counts,
         "remarks": remarks
     }
-
-
