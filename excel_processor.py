@@ -52,7 +52,7 @@ def create_sample_template(file_path: str):
         {"no": 3, "brand": "Brand Beta (สาขา ชิดลม)", "name": "อภิสิทธิ์ ขยันทำ"},
         {"no": 4, "brand": "Brand Beta (สาขา ชิดลม)", "name": "นภา เพลินตา"},
         {"no": 5, "brand": "Brand Delta (สาขา ไอคอนสยาม)", "name": "กิตติพงษ์ ยอดเยี่ยม"},
-        {"no": 6, "brand": "Brand Alpha (สาขา สยาม)", "name": "ดารินทร์ สุขใจ (หัวหน้า)"}
+        {"no": 6, "brand": "Brand Alpha (สาขา สยาม)", "name": "ธนากร มุ่งมั่น"}
     ]
 
     cell_border = Border(
@@ -220,6 +220,27 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
         if header_row_index is None:
             continue
             
+        # ค้นหาชื่อแผนกจริงจากส่วนหัวของ Sheet (เช่น ข้อความ 'แผนก 101 :PRESTIGE ชั้น 1' ในแถว 1-15)
+        sheet_department = None
+        for r_idx in range(1, min(20, sheet.max_row + 1)):
+            for c_idx in range(1, min(sheet.max_column + 1, 35)):
+                val = sheet.cell(row=r_idx, column=c_idx).value
+                if val is not None:
+                    val_clean = str(val).strip()
+                    val_upper = val_clean.upper()
+                    # ตรวจจับข้อความแผนก เช่น "แผนก 101 :PRESTIGE ชั้น 1" หรือ "ฝ่าย..." หรือ "DEPARTMENT"
+                    if any(k in val_upper for k in ["แผนก", "ฝ่าย", "DEPARTMENT", "SECTION"]):
+                        # หลีกเลี่ยงกรณีที่เป็นแค่ชื่อหัวคอลัมน์คำเดียว
+                        if len(val_clean) > 3 and not any(stop in val_upper for stop in STOP_KEYWORDS):
+                            sheet_department = val_clean
+                            break
+            if sheet_department:
+                break
+                
+        # หากไม่พบในเซลล์หัวตาราง ให้ตรวจว่าชื่อ Sheet เป็นชื่อแผนกหรือไม่
+        if not sheet_department:
+            sheet_department = sheet_name.strip()
+            
         # 3. เริ่มดึงข้อมูลพนักงาน (อ่านต่อจากบรรทัดหัวตารางลงมา)
         for row in sheet.iter_rows(min_row=header_row_index + 1, values_only=True):
             if not row:
@@ -238,13 +259,15 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
             if any(stop_word in col_brand for stop_word in STOP_KEYWORDS) or any(stop_word in col_name for stop_word in STOP_KEYWORDS):
                 break
 
+            final_dept = col_dept if (col_dept and col_dept.upper() not in ["NONE", "NULL", "-"]) else sheet_department
+
             # ถ้ามีข้อมูลครบทั้ง Brand และ ชื่อ และไม่ใช่ค่าว่าง/NONE ให้เก็บลงระบบ
             if col_brand and col_name and col_brand.upper() not in ["NONE", "NULL", "-"] and col_name.upper() not in ["NONE", "NULL", "-"]:
                 # ป้องกันเก็บซ้ำใน Sheet เดียวกัน
                 all_employees.append({
                     "name": col_name, 
                     "brand": col_brand,
-                    "department": col_dept or sheet_name
+                    "department": final_dept
                 })
                 # นับจำนวนคนในแบรนด์ เพื่อเอาไปคำนวณสิทธิ์เลือกกะ
                 brand_counts[col_brand] = brand_counts.get(col_brand, 0) + 1
@@ -264,10 +287,14 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
     for emp in all_employees:
         emp["requires_shift_selection"] = brand_counts.get(emp["brand"], 0) > min_staff_threshold
 
+    # 6. รวบรวมรายชื่อแผนกที่ไม่ซ้ำกันทั้งหมด
+    unique_departments = list(dict.fromkeys(emp["department"] for emp in all_employees if emp.get("department")))
+
     # ส่งข้อมูลทั้งหมดกลับไปให้ระบบ API 
     return {
         "total_employees": len(all_employees),
         "employees": all_employees,
+        "departments": unique_departments,
         "brand_counts": brand_counts,
         "remarks": remarks
     }
