@@ -135,7 +135,15 @@ class LeaveSubmitRequest(BaseModel):
 
 class ExcelProcessRequest(BaseModel):
     yearMonth: str
-    period: Optional[str] = "1-15"
+    period: Optional[str] = "1-end"
+    department: Optional[str] = None
+
+class ResetLeavesRequest(BaseModel):
+    yearMonth: Optional[str] = None
+
+class AddEmployeeRequest(BaseModel):
+    name: str
+    brand: str
     department: Optional[str] = None
 
 class BrandRequest(BaseModel):
@@ -144,6 +152,7 @@ class BrandRequest(BaseModel):
 class EmployeeRequest(BaseModel):
     name: str
     brand: str
+    department: Optional[str] = None
 
 class ResetRequestModel(BaseModel):
     line_user_id: Optional[str] = None
@@ -580,7 +589,7 @@ def approve_reset(req: ApproveResetModel):
                     }}
                 )
 
-            # ลบหรือรีเซ็ตข้อมูลการลงทะเบียนของ LINE ID นั้นในตารางผู้ใช้
+            # ลบหรือรีเซ็ตข้อมูลการลงทะเบียนของ LINE ID นั้นในตารางผู้ใช้ และล้าง leaveRecords
             if line_id:
                 # ลบออกจาก main_data (collection หลัก)
                 mongo_collection.update_one(
@@ -590,6 +599,12 @@ def approve_reset(req: ApproveResetModel):
                             "$or": [
                                 {"lineUserId": line_id},
                                 {"line_user_id": line_id}
+                            ]
+                        },
+                        "leaveRecords": {
+                            "$or": [
+                                {"userId": user_id} if user_id else {},
+                                {"userName": emp_name} if emp_name else {}
                             ]
                         }
                     }}
@@ -614,6 +629,8 @@ def approve_reset(req: ApproveResetModel):
         if (line_id and (u.get("lineUserId") == line_id or u.get("line_user_id") == line_id)) or (user_id and u.get("id") == user_id):
             if not emp_name:
                 emp_name = u.get("fullName") or u.get("name")
+            if not user_id:
+                user_id = u.get("id")
             break
 
     # ล้างข้อมูลการลงทะเบียนของผู้ใช้เพื่อให้สามารถเข้าสู่ระบบและลงทะเบียนใหม่ได้
@@ -624,6 +641,21 @@ def approve_reset(req: ApproveResetModel):
             (user_id and u.get("id") == user_id)
         )
     ]
+
+    # ล้างประวัติวันหยุดทั้งหมดใน leaveRecords ที่เป็นของพนักงานคนนั้นออก
+    db["leaveRecords"] = [
+        r for r in db.get("leaveRecords", [])
+        if not (
+            (user_id and r.get("userId") == user_id) or
+            (emp_name and r.get("userName") == emp_name)
+        )
+    ]
+
+    # ปลดล็อกสถานะใน employees (ถ้ามี)
+    for emp in db.get("employees", []):
+        if emp_name and emp.get("name") == emp_name:
+            emp["claimed"] = False
+            emp["claimedBy"] = None
 
     # อัปเดตสถานะใน resetRequests
     requests = db.get("resetRequests", [])
@@ -645,7 +677,7 @@ def approve_reset(req: ApproveResetModel):
 
     return {
         "success": True,
-        "message": f"อนุมัติการรีเซ็ตบัญชีของ {emp_name or 'พนักงาน'} เรียบร้อยแล้ว (สถานะ approved) พนักงานสามารถลงทะเบียนใหม่ได้ทันที"
+        "message": f"อนุมัติการรีเซ็ตบัญชีของ {emp_name or 'พนักงาน'} เรียบร้อยแล้ว (สถานะ approved) ล้างข้อมูลวันหยุดและผู้ใช้เรียบร้อย พนักงานสามารถลงทะเบียนใหม่ได้ทันที"
     }
 
 @app.post("/api/admin/reject-reset")
@@ -768,7 +800,7 @@ async def upload_master_data(
 @app.get("/api/admin/submission-status")
 def get_submission_status(
     yearMonth: str = "2026-09",
-    period: str = "1-15",
+    period: Optional[str] = "1-end",
     supervisorId: Optional[str] = None,
     department: Optional[str] = None
 ):
@@ -782,23 +814,50 @@ def get_submission_status(
     if department and department != "ALL":
         staff_users = [u for u in staff_users if (u.get("department") or "").strip() == department.strip()]
 
-    submitted_user_ids = set(
-        r.get("userId") for r in leave_records
-        if r.get("yearMonth") == yearMonth and r.get("period") == period
-    )
+    # 4.3 Data Analysis Deduplication Logic: Deduplicate by (fullName, brand), take latest
+    dedup_dict = {}
+    for u in staff_users:
+        name = (u.get("fullName") or u.get("displayName") or "").strip()
+        brand = (u.get("brand") or "").strip()
+        key = (name, brand)
+        time_key = u.get("updatedAt") or u.get("createdAt") or ""
+        if key not in dedup_dict or time_key > (dedup_dict[key].get("updatedAt") or dedup_dict[key].get("createdAt") or ""):
+            dedup_dict[key] = u
+    staff_users = list(dedup_dict.values())
+
+    # Unified Period Handling: if '1-end' or 'all', check any record in yearMonth
+    if period in ["1-end", "all", "ALL", None, ""]:
+        submitted_user_ids = set(
+            r.get("userId") for r in leave_records
+            if r.get("yearMonth") == yearMonth
+        )
+        submitted_user_names = set(
+            (r.get("userName") or "").strip() for r in leave_records
+            if r.get("yearMonth") == yearMonth and r.get("userName")
+        )
+    else:
+        submitted_user_ids = set(
+            r.get("userId") for r in leave_records
+            if r.get("yearMonth") == yearMonth and r.get("period") == period
+        )
+        submitted_user_names = set(
+            (r.get("userName") or "").strip() for r in leave_records
+            if r.get("yearMonth") == yearMonth and r.get("period") == period and r.get("userName")
+        )
 
     submitted_list = []
     pending_list = []
 
     for u in staff_users:
+        u_name = (u.get("fullName") or "").strip()
         info = {
             "userId": u.get("id"),
-            "fullName": u.get("fullName"),
+            "fullName": u_name,
             "brand": u.get("brand"),
             "department": u.get("department") or "-",
             "supervisorName": u.get("supervisorName", "-")
         }
-        if u.get("id") in submitted_user_ids:
+        if u.get("id") in submitted_user_ids or u_name in submitted_user_names:
             submitted_list.append(info)
         else:
             pending_list.append(info)
@@ -951,10 +1010,13 @@ def process_excel(req: ExcelProcessRequest):
                 if e.get("name"):
                     allowed_names.add(e.get("name").strip())
 
+    req_period = (req.period or "1-end").strip().lower()
+    is_full_month = req_period in ["1-end", "all", "ALL", ""]
+
     records = [
         r for r in db.get("leaveRecords", [])
         if r.get("yearMonth") == req.yearMonth 
-        and (not req.period or r.get("period") == req.period)
+        and (is_full_month or r.get("period") == req.period)
         and (not req.department or (r.get("userName") and r.get("userName").strip() in allowed_names))
     ]
 
@@ -966,7 +1028,8 @@ def process_excel(req: ExcelProcessRequest):
         )
 
         dept_suffix = f"_{req.department}" if req.department else ""
-        filename = f"Leave_Schedule_{req.yearMonth}_{req.period or 'All'}{dept_suffix}.xlsx"
+        period_label = "FullMonth" if is_full_month else (req.period or "All")
+        filename = f"Smart_Roster_{req.yearMonth}_{period_label}{dept_suffix}.xlsx"
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Updated-Cells-Count": str(updated_count),
@@ -980,3 +1043,161 @@ def process_excel(req: ExcelProcessRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# ADMIN DATA MANAGEMENT ENDPOINTS (SPEC 4.4)
+# ---------------------------------------------------------
+
+@app.post("/api/admin/reset-leaves")
+def admin_reset_leaves(req: Optional[ResetLeavesRequest] = None):
+    """
+    POST /api/admin/reset-leaves
+    ล้างเฉพาะ leaveRecords ของทุกแผนกในรอบเดือนที่เลือก เพื่อเริ่มเก็บใหม่ โดยคงรายชื่อ Master Data ไว้ครบถ้วน
+    """
+    db = read_db()
+    records = db.get("leaveRecords", [])
+    target_month = req.yearMonth if req and req.yearMonth else None
+
+    if target_month and target_month != "ALL":
+        new_records = [r for r in records if r.get("yearMonth") != target_month]
+    else:
+        new_records = []
+
+    db["leaveRecords"] = new_records
+    write_db(db)
+
+    if mongo_client:
+        try:
+            if target_month and target_month != "ALL":
+                mongo_collection.update_one(
+                    {"_id": "main_db"},
+                    {"$pull": {"leaveRecords": {"yearMonth": target_month}}}
+                )
+            else:
+                mongo_collection.update_one(
+                    {"_id": "main_db"},
+                    {"$set": {"leaveRecords": []}}
+                )
+        except Exception as e:
+            print("MongoDB reset-leaves error:", e)
+
+    return {
+        "success": True,
+        "message": f"ล้างข้อมูลบันทึกวันหยุดประจำเดือน {target_month or 'ทั้งหมด'} เรียบร้อยแล้ว (Master Data รายชื่อยังคงอยู่ครบถ้วน)"
+    }
+
+@app.post("/api/admin/clear-master-data")
+def admin_clear_master_data():
+    """
+    POST /api/admin/clear-master-data
+    เคลียร์ employees, brands, และ departments ทั้งหมดในระบบ
+    """
+    db = read_db()
+    db["employees"] = []
+    db["brands"] = []
+    db["departments"] = []
+    db["remarks"] = []
+    db["brandCounts"] = {}
+    write_db(db)
+
+    if mongo_client:
+        try:
+            mongo_collection.update_one(
+                {"_id": "main_db"},
+                {"$set": {
+                    "employees": [],
+                    "brands": [],
+                    "departments": [],
+                    "remarks": [],
+                    "brandCounts": {}
+                }}
+            )
+        except Exception as e:
+            print("MongoDB clear-master-data error:", e)
+
+    return {
+        "success": True,
+        "message": "ล้าง Master Data ทั้งหมด (รายชื่อพนักงาน, แบรนด์, และแผนก) ออกจากระบบเรียบร้อยแล้ว"
+    }
+
+@app.post("/api/admin/employee")
+def admin_add_employee(req: AddEmployeeRequest):
+    """
+    POST /api/admin/employee
+    เพิ่มพนักงานใหม่รายคน: { "name": str, "brand": str, "department": Optional[str] }
+    """
+    if not req.name or not req.name.strip():
+        raise HTTPException(status_code=400, detail="กรุณาระบุชื่อพนักงาน")
+    if not req.brand or not req.brand.strip():
+        raise HTTPException(status_code=400, detail="กรุณาระบุแบรนด์")
+
+    name = req.name.strip()
+    brand = req.brand.strip()
+    dept = (req.department or "").strip()
+
+    db = read_db()
+    employees = db.get("employees", [])
+    brands = db.get("brands", [])
+    departments = db.get("departments", [])
+
+    existing = next((e for e in employees if e.get("name") == name and e.get("brand") == brand), None)
+    if existing:
+        raise HTTPException(status_code=400, detail=f"พนักงาน '{name}' แบรนด์ '{brand}' มีอยู่ในระบบแล้ว")
+
+    new_emp = {
+        "id": f"emp_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:4]}",
+        "name": name,
+        "brand": brand,
+        "department": dept,
+        "requiresShiftSelection": False
+    }
+    employees.append(new_emp)
+
+    if not any(b.get("name") == brand for b in brands):
+        brands.append({
+            "id": f"b_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:4]}",
+            "name": brand
+        })
+
+    if dept and dept not in departments:
+        departments.append(dept)
+
+    db["employees"] = employees
+    db["brands"] = brands
+    db["departments"] = departments
+    write_db(db)
+
+    return {
+        "success": True,
+        "message": f"เพิ่มพนักงาน '{name}' สำเร็จ",
+        "employee": new_emp
+    }
+
+@app.delete("/api/admin/employee/{emp_id}")
+def admin_delete_employee(emp_id: str):
+    """
+    DELETE /api/admin/employee/{emp_id}
+    ลบพนักงานรายคน
+    """
+    db = read_db()
+    employees = db.get("employees", [])
+    target = next((e for e in employees if e.get("id") == emp_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="ไม่พบพนักงานที่ต้องการลบ")
+
+    db["employees"] = [e for e in employees if e.get("id") != emp_id]
+    write_db(db)
+
+    if mongo_client:
+        try:
+            mongo_collection.update_one(
+                {"_id": "main_db"},
+                {"$pull": {"employees": {"id": emp_id}}}
+            )
+        except Exception as e:
+            print("MongoDB delete employee error:", e)
+
+    return {
+        "success": True,
+        "message": f"ลบพนักงาน '{target.get('name')}' เรียบร้อยแล้ว"
+    }
