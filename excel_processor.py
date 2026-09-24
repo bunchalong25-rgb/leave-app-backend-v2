@@ -36,39 +36,39 @@ def create_sample_template(file_path: str):
     ws.title = "ตารางวันหยุดพนักงาน"
     ws.views.sheetView[0].showGridLines = True
 
-    # Title Banner (Row 1)
+    # Title Banner (Row 1) - Executive Platinum & Deep Navy
     ws.merge_cells('A1:AI1')
     title_cell = ws['A1']
-    title_cell.value = "ตารางการทำงานและวันหยุดพนักงานประจำเดือน (Template ต้นฉบับ)"
+    title_cell.value = "Smart Roster - ระบบจัดตารางเวลาและวันหยุดพนักงาน"
     title_cell.font = Font(name='Sarabun', size=16, bold=True, color='FFFFFF')
     title_cell.fill = PatternFill(start_color='0F172A', end_color='0F172A', fill_type='solid')
     title_cell.alignment = Alignment(horizontal='center', vertical='center')
     ws.row_dimensions[1].height = 36
 
-    # Subtitle Legend (Row 2)
+    # Subtitle Legend (Row 2) - Updated to 6 Standard Leave Codes
     ws.merge_cells('A2:AI2')
     legend_cell = ws['A2']
-    legend_cell.value = "สัญลักษณ์: W = วันหยุดประจำเดือน | C = วันเข้าบริษัท | V = วันลาพักร้อน | S = วันลาป่วย | N = วันหยุดไม่มีคนแทน"
+    legend_cell.value = "สัญลักษณ์: W = วันหยุดประจำสัปดาห์ | V = พักร้อน | B = ลาสวัสดิการ | E = ไปเรียน | C = ขอเปลี่ยนเวรหยุด | D = ไปอบรม/สัมมนา"
     legend_cell.font = Font(name='Sarabun', size=10, italic=True, color='334155')
-    legend_cell.fill = PatternFill(start_color='F1F5F9', end_color='F1F5F9', fill_type='solid')
+    legend_cell.fill = PatternFill(start_color='F8FAFC', end_color='F8FAFC', fill_type='solid')
     legend_cell.alignment = Alignment(horizontal='center', vertical='center')
     ws.row_dimensions[2].height = 24
 
-    # Table Column Headers (Row 3)
-    headers = ['ลำดับ', 'แบรนด์ / สาขา', 'ชื่อ-นามสกุล'] + [str(d) for d in range(1, 32)]
+    # Table Column Headers (Row 3) - Slate Frost (#F1F5F9) & Dark Slate (#334155)
+    headers = ['ลำดับ', 'แบรนด์ / สาขา', 'ชื่อ'] + [str(d) for d in range(1, 32)]
     ws.row_dimensions[3].height = 28
     
     thin_border = Border(
         left=Side(style='thin', color='CBD5E1'),
         right=Side(style='thin', color='CBD5E1'),
         top=Side(style='thin', color='CBD5E1'),
-        bottom=Side(style='medium', color='0284C7')
+        bottom=Side(style='medium', color='64748B')
     )
 
     for col_idx, h in enumerate(headers, 1):
         cell = ws.cell(row=3, column=col_idx, value=int(h) if h.isdigit() else h)
-        cell.font = Font(name='Sarabun', size=11, bold=True, color='FFFFFF')
-        cell.fill = PatternFill(start_color='0284C7', end_color='0284C7', fill_type='solid')
+        cell.font = Font(name='Sarabun', size=11, bold=True, color='334155')
+        cell.fill = PatternFill(start_color='F1F5F9', end_color='F1F5F9', fill_type='solid')
         cell.alignment = Alignment(horizontal='center', vertical='center')
         cell.border = thin_border
 
@@ -105,8 +105,8 @@ def create_sample_template(file_path: str):
             c.border = cell_border
 
     ws.column_dimensions['A'].width = 8
-    ws.column_dimensions['B'].width = 28
-    ws.column_dimensions['C'].width = 24
+    ws.column_dimensions['B'].width = 24
+    ws.column_dimensions['C'].width = 20
     for d in range(1, 32):
         col_letter = openpyxl.utils.get_column_letter(d + 3)
         ws.column_dimensions[col_letter].width = 5
@@ -149,25 +149,35 @@ def process_excel_template(template_path: str, leave_records: list, period: str 
                 if len(raw_name) >= 2 and raw_name not in emp_row_map:
                     emp_row_map[raw_name] = r
 
-    # 3. Fill Leave Codes
+    # 3. Fill Leave Codes (6 Leave Types + Optional Shifts)
     updated_count = 0
     code_colors = {
-        'W': '2563EB', # Blue
-        'C': '059669', # Emerald
-        'V': 'D97706', # Amber
+        'W': '2563EB', # Blue (วันหยุดประจำสัปดาห์)
+        'V': 'D97706', # Amber (พักร้อน)
+        'B': '7C3AED', # Purple (ลาสวัสดิการ)
+        'E': '0284C7', # Cyan/Sky (ไปเรียน)
+        'C': '059669', # Emerald (ขอเปลี่ยนเวรหยุด)
+        'D': 'E11D48', # Rose (ไปอบรม/สัมมนา)
+        '1': '0F172A', # Shift 1
+        '9': '0F172A', # Shift 9
+        '14': '0F172A', # Shift 14
         'S': 'DC2626', # Red
         'N': '475569'  # Slate
     }
+
+    # Normalize period: '1-15', '16-end', '1-end', 'all'
+    period_clean = (period or '1-end').strip().lower()
 
     for rec in leave_records:
         day_num = rec.get('dayNumber')
         if not day_num:
             continue
 
-        if period == '1-15' and day_num > 15:
+        if period_clean == '1-15' and day_num > 15:
             continue
-        if period == '16-end' and day_num < 16:
+        if period_clean == '16-end' and day_num < 16:
             continue
+        # If '1-end' or 'all', include all days 1..31
 
         col_idx = day_col_map.get(day_num)
         if not col_idx:
@@ -189,7 +199,7 @@ def process_excel_template(template_path: str, leave_records: list, period: str 
             code = rec.get('code', '')
             cell.value = code
             
-            color_argb = code_colors.get(code, '0F172A')
+            color_argb = code_colors.get(str(code).strip().upper(), '0F172A')
             cell.font = Font(name='Sarabun', size=11, bold=True, color=color_argb)
             cell.alignment = Alignment(horizontal='center', vertical='center')
             updated_count += 1
@@ -334,13 +344,3 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
             unique_departments.append(d)
     for emp in all_employees:
         d = emp.get("department")
-        if d and d not in unique_departments:
-            unique_departments.append(d)
-
-    return {
-        "total_employees": len(all_employees),
-        "employees": all_employees,
-        "departments": unique_departments,
-        "brand_counts": brand_counts,
-        "remarks": remarks
-    }
