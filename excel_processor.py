@@ -344,3 +344,13 @@ def process_master_data_excel(file_content: bytes, min_staff_threshold: int = 2)
             unique_departments.append(d)
     for emp in all_employees:
         d = emp.get("department")
+        if d and d not in unique_departments:
+            unique_departments.append(d)
+
+    return {
+        "total_employees": len(all_employees),
+        "employees": all_employees,
+        "departments": unique_departments,
+        "brand_counts": brand_counts,
+        "remarks": remarks
+    }
