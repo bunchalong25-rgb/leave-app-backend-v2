@@ -61,11 +61,17 @@ if MONGO_URI:
     mongo_db = mongo_client["leave_app_db"]
     mongo_collection = mongo_db["main_data"]
     mongo_reset_col = mongo_db["reset_requests"]
+    mongo_users_col = mongo_db["users"]
+    mongo_audit_col = mongo_db["auditLogs"]
+    mongo_heartbeat_col = mongo_db["heartbeats"]
 else:
     mongo_client = None
     mongo_db = None
     mongo_collection = None
     mongo_reset_col = None
+    mongo_users_col = None
+    mongo_audit_col = None
+    mongo_heartbeat_col = None
 
 def read_db():
     if mongo_client:
@@ -175,6 +181,34 @@ class RejectResetModel(BaseModel):
     requestId: str
     reason: Optional[str] = None
 
+class InlineLeaveEditRequest(BaseModel):
+    employeeName: str
+    brand: str
+    department: Optional[str] = None
+    date: str
+    yearMonth: str
+    leaveCode: Optional[str] = None
+    shift: Optional[str] = None
+    actionBy: Optional[str] = "หัวหน้างาน"
+    actionRole: Optional[str] = "admin"
+
+class AdminSelfResetRequest(BaseModel):
+    adminId: Optional[str] = None
+    lineUserId: Optional[str] = None
+    fullName: Optional[str] = None
+
+class HeartbeatRequest(BaseModel):
+    userId: str
+    fullName: str
+    role: Optional[str] = "staff"
+    brand: Optional[str] = None
+    department: Optional[str] = None
+    lineUserId: Optional[str] = None
+
+class AuthCheckRequest(BaseModel):
+    lineUserId: Optional[str] = None
+    userId: Optional[str] = None
+
 # Base Configs
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://creative-macaron-98004d.netlify.app")
 LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID", "")
@@ -282,13 +316,81 @@ async def line_oauth_callback(code: Optional[str] = None, state: Optional[str] =
 
 @app.post("/api/auth/login-line")
 def login_line(req: LineLoginRequest):
-    db = read_db()
-    users = db.get("users", [])
-    matched = next((u for u in users if u.get("lineUserId") == req.lineUserId), None)
+    # 1. Check MongoDB users collection first
+    matched = None
+    if mongo_client and mongo_users_col is not None:
+        try:
+            doc = mongo_users_col.find_one({
+                "$or": [{"lineUserId": req.lineUserId}, {"line_user_id": req.lineUserId}]
+            })
+            if doc:
+                matched = {k: v for k, v in doc.items() if k != '_id'}
+                matched["id"] = matched.get("id") or str(doc.get("_id"))
+        except Exception as e:
+            print("MongoDB login-line error:", e)
+
+    # 2. Check main_data / JSON db
+    if not matched:
+        db = read_db()
+        users = db.get("users", [])
+        matched = next((u for u in users if u.get("lineUserId") == req.lineUserId or u.get("line_user_id") == req.lineUserId), None)
+
     if matched:
-        return {"exists": True, "user": matched}
+        token = f"tok_{matched.get('id', 'usr')}_{req.lineUserId}"
+        return {
+            "exists": True,
+            "hasCompletedOnboarding": True,
+            "user": matched,
+            "token": token
+        }
     else:
         return {"exists": False, "lineUserId": req.lineUserId, "displayName": req.displayName}
+
+@app.get("/api/auth/me")
+def get_auth_me(lineUserId: Optional[str] = None, userId: Optional[str] = None):
+    """
+    GET /api/auth/me?lineUserId=...&userId=...
+    ตรวจสอบตัวตนและกู้คืนโปรไฟล์เดิมอัตโนมัติ (Persistent Login & LINE Recovery)
+    """
+    if not lineUserId and not userId:
+        raise HTTPException(status_code=400, detail="Missing lineUserId or userId")
+
+    matched = None
+    if mongo_client and mongo_users_col is not None:
+        try:
+            query = []
+            if lineUserId:
+                query.extend([{"lineUserId": lineUserId}, {"line_user_id": lineUserId}])
+            if userId:
+                query.extend([{"id": userId}, {"_id": userId}])
+            doc = mongo_users_col.find_one({"$or": query})
+            if doc:
+                matched = {k: v for k, v in doc.items() if k != '_id'}
+                matched["id"] = matched.get("id") or str(doc.get("_id"))
+        except Exception as e:
+            print("MongoDB /api/auth/me error:", e)
+
+    if not matched:
+        db = read_db()
+        users = db.get("users", [])
+        matched = next((u for u in users if (
+            (lineUserId and (u.get("lineUserId") == lineUserId or u.get("line_user_id") == lineUserId)) or
+            (userId and u.get("id") == userId)
+        )), None)
+
+    if matched and (matched.get("hasCompletedOnboarding") or matched.get("fullName")):
+        token = f"tok_{matched.get('id', 'usr')}_{matched.get('lineUserId', '')}"
+        return {
+            "exists": True,
+            "hasCompletedOnboarding": True,
+            "user": matched,
+            "token": token
+        }
+    return {"exists": False}
+
+@app.post("/api/auth/check")
+def check_auth(req: AuthCheckRequest):
+    return get_auth_me(lineUserId=req.lineUserId, userId=req.userId)
 
 @app.get("/api/onboarding/options")
 def get_onboarding_options():
@@ -348,6 +450,17 @@ def register_onboarding(req: OnboardingRequest):
     }
     db["users"].append(user)
     write_db(db)
+
+    if mongo_client and mongo_users_col is not None:
+        try:
+            mongo_users_col.update_one(
+                {"lineUserId": req.lineUserId},
+                {"$set": user},
+                upsert=True
+            )
+        except Exception as e:
+            print("MongoDB register_onboarding error:", e)
+
     return {"success": True, "user": user}
 
 # ---------------------------------------------------------
@@ -1200,4 +1313,296 @@ def admin_delete_employee(emp_id: str):
     return {
         "success": True,
         "message": f"ลบพนักงาน '{target.get('name')}' เรียบร้อยแล้ว"
+    }
+
+# ============================================================
+# PHASE 2: ADMIN SELF-RESET (Bypass Approval & Retain Subordinate Data)
+# ============================================================
+
+@app.post("/api/admin/self-reset")
+def admin_self_reset(req: AdminSelfResetRequest):
+    """
+    POST /api/admin/self-reset
+    รีเซ็ตสิทธิ์หัวหน้างานโดยไม่ต้องรออนุมัติ
+    ลบเฉพาะข้อมูลบัญชีของหัวหน้าใน collection users เท่านั้น
+    ข้อมูลพนักงาน, แบรนด์, แผนก, และประวัติวันหยุดทั้งหมดคงอยู่ 100%
+    """
+    admin_id = req.adminId
+    line_user_id = req.lineUserId
+    full_name = req.fullName
+
+    if not admin_id and not line_user_id and not full_name:
+        raise HTTPException(status_code=400, detail="Missing admin identifier")
+
+    db = read_db()
+    users = db.get("users", [])
+    
+    # กรองเอาเฉพาะ User ที่ไม่ใช่ Admin คนนี้
+    filtered_users = []
+    removed = False
+    for u in users:
+        is_target = False
+        if admin_id and u.get("id") == admin_id:
+            is_target = True
+        elif line_user_id and (u.get("lineUserId") == line_user_id or u.get("line_user_id") == line_user_id):
+            is_target = True
+        elif full_name and u.get("fullName") == full_name and u.get("role") == "admin":
+            is_target = True
+        
+        if is_target:
+            removed = True
+        else:
+            filtered_users.append(u)
+
+    db["users"] = filtered_users
+    write_db(db)
+
+    # Sync with MongoDB
+    if mongo_client:
+        try:
+            query = []
+            if admin_id: query.extend([{"id": admin_id}, {"_id": admin_id}])
+            if line_user_id: query.extend([{"lineUserId": line_user_id}, {"line_user_id": line_user_id}])
+            if full_name: query.append({"fullName": full_name, "role": "admin"})
+            
+            if mongo_users_col is not None and query:
+                mongo_users_col.delete_many({"$or": query})
+            
+            mongo_collection.update_one(
+                {"_id": "main_db"},
+                {"$set": {"users": filtered_users}}
+            )
+        except Exception as e:
+            print("MongoDB admin_self_reset error:", e)
+
+    return {
+        "success": True,
+        "message": "รีเซ็ตบัญชีหัวหน้างานเรียบร้อยแล้ว ข้อมูลส่วนกลางและบันทึกวันหยุดของพนักงานทุกคนยังคงอยู่ครบถ้วน"
+    }
+
+# ============================================================
+# PHASE 2: INLINE LEAVE EDIT & AUTO SUBMIT & AUDIT LOGS
+# ============================================================
+
+@app.post("/api/admin/inline-leave-edit")
+def admin_inline_leave_edit(req: InlineLeaveEditRequest):
+    """
+    POST /api/admin/inline-leave-edit
+    หัวหน้าแก้ไขวันหยุดและกะแทนพนักงานได้จากตารางโดยตรง พร้อมบันทึก Audit Log และปรับสถานะเป็นส่งแล้ว
+    """
+    emp_name = req.employeeName.strip()
+    brand = req.brand.strip()
+    date_str = req.date.strip()
+    year_month = req.yearMonth.strip()
+    new_code = (req.leaveCode or "").strip().upper() or None
+    new_shift = (req.shift or "").strip() or None
+    action_by = req.actionBy or "หัวหน้างาน"
+    action_role = req.actionRole or "admin"
+
+    try:
+        day_num = int(date_str.split("-")[-1])
+    except Exception:
+        day_num = 1
+
+    period = "1-15" if day_num <= 15 else "16-end"
+    now_iso = datetime.utcnow().isoformat()
+
+    db = read_db()
+    leave_records = db.get("leaveRecords", [])
+
+    # ค้นหา Record เดิมในวันนั้น
+    prev_record = next(
+        (r for r in leave_records if (
+            r.get("userName") == emp_name and
+            r.get("brand") == brand and
+            (r.get("date") == date_str or (r.get("yearMonth") == year_month and r.get("dayNumber") == day_num))
+        )),
+        None
+    )
+
+    prev_code = prev_record.get("code") if prev_record else None
+    prev_shift = prev_record.get("shift") if prev_record else None
+
+    # อัปเดตหรือสร้างใหม่
+    if prev_record:
+        if new_code or new_shift:
+            prev_record["code"] = new_code
+            prev_record["shift"] = new_shift
+            prev_record["updatedAt"] = now_iso
+            prev_record["editedByAdmin"] = True
+        else:
+            # ล้างค่าทั้งคู่
+            leave_records = [r for r in leave_records if r != prev_record]
+    else:
+        if new_code or new_shift:
+            new_rec = {
+                "id": f"lr_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:4]}",
+                "userId": f"usr_{uuid.uuid4().hex[:6]}",
+                "userName": emp_name,
+                "brand": brand,
+                "yearMonth": year_month,
+                "period": period,
+                "date": date_str,
+                "dayNumber": day_num,
+                "code": new_code,
+                "shift": new_shift,
+                "updatedAt": now_iso,
+                "editedByAdmin": True
+            }
+            leave_records.append(new_rec)
+
+    db["leaveRecords"] = leave_records
+
+    # สร้าง Audit Log
+    audit_id = f"aud_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:4]}"
+    audit_entry = {
+        "id": audit_id,
+        "employeeName": emp_name,
+        "brand": brand,
+        "department": req.department or "-",
+        "date": date_str,
+        "yearMonth": year_month,
+        "previousValue": prev_code or "ไม่มี",
+        "newValue": new_code or "ล้างค่า",
+        "previousShift": prev_shift or "ไม่มี",
+        "newShift": new_shift or "ไม่มี",
+        "actionBy": action_by,
+        "actionRole": action_role,
+        "timestamp": now_iso
+    }
+
+    if "auditLogs" not in db:
+        db["auditLogs"] = []
+    db["auditLogs"].append(audit_entry)
+
+    write_db(db)
+
+    # Sync Audit Log กับ MongoDB
+    if mongo_client and mongo_audit_col is not None:
+        try:
+            mongo_audit_col.insert_one({**audit_entry, "_id": audit_id})
+        except Exception as e:
+            print("MongoDB insert auditLogs error:", e)
+
+    return {
+        "success": True,
+        "message": f"บันทึกวันหยุดและกะของ '{emp_name}' เรียบร้อยแล้ว",
+        "auditLog": audit_entry
+    }
+
+@app.get("/api/audit-logs")
+def get_audit_logs(yearMonth: Optional[str] = None, employeeName: Optional[str] = None, brand: Optional[str] = None):
+    """
+    GET /api/audit-logs
+    ดึงประวัติการแก้ไขตารางงาน
+    """
+    if mongo_client and mongo_audit_col is not None:
+        try:
+            query = {}
+            if yearMonth: query["yearMonth"] = yearMonth
+            if employeeName: query["employeeName"] = employeeName
+            if brand: query["brand"] = brand
+
+            cursor = mongo_audit_col.find(query).sort("timestamp", -1).limit(100)
+            logs = []
+            for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                logs.append(doc)
+            return {"success": True, "logs": logs}
+        except Exception as e:
+            print("MongoDB get_audit_logs error:", e)
+
+    db = read_db()
+    logs = db.get("auditLogs", [])
+    if yearMonth:
+        logs = [l for l in logs if l.get("yearMonth") == yearMonth]
+    if employeeName:
+        logs = [l for l in logs if l.get("employeeName") == employeeName]
+    if brand:
+        logs = [l for l in logs if l.get("brand") == brand]
+
+    sorted_logs = sorted(logs, key=lambda x: x.get("timestamp", ""), reverse=True)
+    return {"success": True, "logs": sorted_logs[:100]}
+
+# ============================================================
+# PHASE 2: HEARTBEAT & REAL-TIME SYSTEM MONITOR (Developer Exclusive)
+# ============================================================
+
+@app.post("/api/monitor/heartbeat")
+def record_heartbeat(req: HeartbeatRequest):
+    """
+    POST /api/monitor/heartbeat
+    รับ Ping จากหน้าบ้านทุก 90 วินาที เพื่อเช็คผู้ใช้งานออนไลน์สด
+    """
+    now_iso = datetime.utcnow().isoformat()
+    now_ts = datetime.utcnow().timestamp()
+
+    user_info = {
+        "userId": req.userId,
+        "fullName": req.fullName,
+        "role": req.role or "staff",
+        "brand": req.brand or "-",
+        "department": req.department or "-",
+        "lineUserId": req.lineUserId or "-",
+        "lastActiveAt": now_iso,
+        "lastActiveTimestamp": now_ts
+    }
+
+    if mongo_client and mongo_heartbeat_col is not None:
+        try:
+            mongo_heartbeat_col.update_one(
+                {"userId": req.userId},
+                {"$set": user_info},
+                upsert=True
+            )
+        except Exception as e:
+            print("MongoDB heartbeat error:", e)
+
+    db = read_db()
+    if "heartbeats" not in db:
+        db["heartbeats"] = []
+
+    existing = next((h for h in db["heartbeats"] if h.get("userId") == req.userId), None)
+    if existing:
+        existing.update(user_info)
+    else:
+        db["heartbeats"].append(user_info)
+
+    write_db(db)
+    return {"success": True, "timestamp": now_iso}
+
+@app.get("/api/monitor/active-users")
+def get_active_users():
+    """
+    GET /api/monitor/active-users
+    ดึงรายชื่อผู้ที่ Active ภายใน 5 นาทีล่าสุด (300 วินาที)
+    """
+    cutoff_ts = datetime.utcnow().timestamp() - 300
+
+    active_users = []
+    if mongo_client and mongo_heartbeat_col is not None:
+        try:
+            cursor = mongo_heartbeat_col.find({
+                "lastActiveTimestamp": {"$gte": cutoff_ts}
+            }).sort("lastActiveTimestamp", -1)
+            for doc in cursor:
+                doc["_id"] = str(doc.get("_id", ""))
+                active_users.append(doc)
+            return {
+                "success": True,
+                "onlineCount": len(active_users),
+                "activeUsers": active_users
+            }
+        except Exception as e:
+            print("MongoDB get_active_users error:", e)
+
+    db = read_db()
+    heartbeats = db.get("heartbeats", [])
+    active = [h for h in heartbeats if h.get("lastActiveTimestamp", 0) >= cutoff_ts]
+    sorted_active = sorted(active, key=lambda x: x.get("lastActiveTimestamp", 0), reverse=True)
+
+    return {
+        "success": True,
+        "onlineCount": len(sorted_active),
+        "activeUsers": sorted_active
     }
