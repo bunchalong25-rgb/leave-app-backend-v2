@@ -118,6 +118,7 @@ class LineLoginRequest(BaseModel):
 class OnboardingRequest(BaseModel):
     lineUserId: str
     displayName: Optional[str] = None
+    pictureUrl: Optional[str] = None
     fullName: str
     brand: str
     department: Optional[str] = None
@@ -125,6 +126,13 @@ class OnboardingRequest(BaseModel):
     supervisorId: Optional[str] = None
     supervisorName: Optional[str] = None
     inviteCode: Optional[str] = None
+    pdpaConsent: Optional[bool] = None
+    pdpaConsentAt: Optional[str] = None
+
+class PdpaConsentRequest(BaseModel):
+    userId: Optional[str] = None
+    lineUserId: Optional[str] = None
+    pdpaConsent: bool = True
 
 class CutoffRequest(BaseModel):
     yearMonth: str
@@ -439,6 +447,7 @@ def register_onboarding(req: OnboardingRequest):
         "id": f"usr_{int(datetime.utcnow().timestamp())}",
         "lineUserId": req.lineUserId,
         "displayName": req.displayName or req.fullName,
+        "pictureUrl": req.pictureUrl,
         "fullName": req.fullName,
         "department": req.department,
         "brand": req.brand,
@@ -446,6 +455,8 @@ def register_onboarding(req: OnboardingRequest):
         "supervisorId": req.supervisorId,
         "supervisorName": req.supervisorName,
         "hasCompletedOnboarding": True,
+        "pdpaConsent": req.pdpaConsent or False,
+        "pdpaConsentAt": req.pdpaConsentAt or None,
         "createdAt": datetime.utcnow().isoformat()
     }
     db["users"].append(user)
@@ -462,6 +473,34 @@ def register_onboarding(req: OnboardingRequest):
             print("MongoDB register_onboarding error:", e)
 
     return {"success": True, "user": user}
+
+@app.post("/api/user/pdpa-consent")
+def update_pdpa_consent(req: PdpaConsentRequest):
+    now_iso = datetime.utcnow().isoformat()
+    # 1. Update in MongoDB users collection
+    if mongo_client and mongo_users_col is not None:
+        try:
+            query = []
+            if req.userId:
+                query.extend([{"id": req.userId}, {"_id": req.userId}])
+            if req.lineUserId:
+                query.extend([{"lineUserId": req.lineUserId}, {"line_user_id": req.lineUserId}])
+            if query:
+                mongo_users_col.update_many(
+                    {"$or": query},
+                    {"$set": {"pdpaConsent": req.pdpaConsent, "pdpaConsentAt": now_iso}}
+                )
+        except Exception as e:
+            print("MongoDB update pdpa error:", e)
+
+    # 2. Update local db
+    db = read_db()
+    for u in db.get("users", []):
+        if (req.userId and u.get("id") == req.userId) or (req.lineUserId and (u.get("lineUserId") == req.lineUserId or u.get("line_user_id") == req.lineUserId)):
+            u["pdpaConsent"] = req.pdpaConsent
+            u["pdpaConsentAt"] = now_iso
+    write_db(db)
+    return {"success": True, "pdpaConsent": req.pdpaConsent, "pdpaConsentAt": now_iso}
 
 # ---------------------------------------------------------
 # ACCOUNT RESET REQUESTS API (FastAPI + MongoDB)
